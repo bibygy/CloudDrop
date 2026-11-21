@@ -96,8 +96,16 @@ function renderCloudTab(bodyEl) {
 
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button class="btn btn-primary" id="btn-connect-gdrive" type="button">${ICONS.cloud}<span>${gdriveConnected ? '重新授权 Google Drive' : '连接 Google Drive'}</span></button>
-        <button class="btn btn-secondary" id="btn-connect-gdrive-redirect" type="button">手机端跳转授权</button>
+        <button class="btn btn-secondary" id="btn-connect-gdrive-redirect" type="button">当前页跳转授权</button>
         ${gdriveConnected ? `<button class="btn btn-danger" id="btn-disconnect-gdrive" type="button">断开连接</button>` : ''}
+      </div>
+
+      <div class="form-group">
+        <div class="form-label"><span>当前设备来源与回调地址（需加入 Google Cloud OAuth）</span></div>
+        <div class="copy-uri-row" style="margin-top:0;">
+          <span>${escapeHtml(redirectUri)}</span>
+          <button class="btn btn-secondary btn-sm" data-copy-text="${escapeHtml(redirectUri)}" type="button">复制</button>
+        </div>
       </div>
 
       <details class="setup-guide">
@@ -141,8 +149,16 @@ function renderCloudTab(bodyEl) {
 
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button class="btn btn-primary" id="btn-connect-od" type="button">${ICONS.cloud}<span>${onedriveConnected ? '重新授权 OneDrive' : '连接 OneDrive'}</span></button>
-        <button class="btn btn-secondary" id="btn-connect-od-redirect" type="button">手机端跳转授权</button>
+        <button class="btn btn-secondary" id="btn-connect-od-redirect" type="button">当前页跳转授权</button>
         ${onedriveConnected ? `<button class="btn btn-danger" id="btn-disconnect-od" type="button">断开连接</button>` : ''}
+      </div>
+
+      <div class="form-group">
+        <div class="form-label"><span>当前设备回调地址（需加入 Azure SPA 重定向 URI）</span></div>
+        <div class="copy-uri-row" style="margin-top:0;">
+          <span>${escapeHtml(redirectUri)}</span>
+          <button class="btn btn-secondary btn-sm" data-copy-text="${escapeHtml(redirectUri)}" type="button">复制</button>
+        </div>
       </div>
 
       <details class="setup-guide">

@@ -7,4 +7,5 @@ platforms/tauri/target/
 platforms/android/.gradle/
 platforms/android/build/
 platforms/android/app/build/
+platforms/android/app/src/main/assets/
 platforms/android/local.properties

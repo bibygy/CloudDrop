@@ -28,13 +28,17 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
 
-    sourceSets {
-        getByName("main") {
-            // Directly bundle the shared cross-platform web/ frontend into Android assets
-            assets.srcDirs("../../../web")
-        }
-    }
+val syncWebAssets = tasks.register<Sync>("syncWebAssets") {
+    val webDir = rootProject.layout.projectDirectory.dir("../../web").asFile
+    onlyIf { webDir.exists() }
+    from(webDir)
+    into(layout.projectDirectory.dir("src/main/assets"))
+}
+
+tasks.named("preBuild") {
+    dependsOn(syncWebAssets)
 }
 
 dependencies {

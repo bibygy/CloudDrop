@@ -30,10 +30,8 @@ jobs:
           yes | "$SDKMGR" --licenses > /dev/null || true
           "$SDKMGR" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
-      - name: Sync Web Assets into Android App
-        run: |
-          mkdir -p platforms/android/app/src/main/assets
-          cp -r web/* platforms/android/app/src/main/assets/
+      - name: Clean stale Android assets before Gradle sync
+        run: rm -rf platforms/android/app/src/main/assets
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4

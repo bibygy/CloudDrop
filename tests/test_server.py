@@ -141,3 +141,33 @@ def test_onedrive_proxy_strict_host_allowlist(server):
     assert clouddrop.is_allowed_onedrive_url("https://public.dm.files.1drv.com/y4mTest") is True
 
 
+def test_logs_api_read_and_clear(tmp_path: Path):
+    log_file = tmp_path / "clouddrop.log"
+    clouddrop.setup_logging(log_file)
+    clouddrop.logger.info("测试日志条目 alpha")
+
+    srv = clouddrop.CloudDropServer(("127.0.0.1", 0), data_dir=tmp_path, lan_url=None, log_file=log_file)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        status, _, body = req(f"{base}/api/logs?tail=50")
+        assert status == 200
+        data = json.loads(body)
+        assert data["ok"] is True
+        assert any("测试日志条目 alpha" in line for line in data["lines"])
+
+        status, _, _ = req(f"{base}/api/logs/clear", method="POST")
+        assert status == 200
+
+        status, _, body = req(f"{base}/api/logs?tail=50")
+        assert status == 200
+        data2 = json.loads(body)
+        assert not any("测试日志条目 alpha" in line for line in data2["lines"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+

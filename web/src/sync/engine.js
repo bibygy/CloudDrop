@@ -19,6 +19,7 @@ import { LocalProvider } from '../providers/local.js';
 import { GoogleDriveProvider } from '../providers/gdrive.js';
 import { OneDriveProvider } from '../providers/onedrive.js';
 import { extractTags } from '../ui/markdown.js';
+import { appLog } from '../ui/logger.js';
 
 export class SyncEngine {
   constructor() {
@@ -57,6 +58,7 @@ export class SyncEngine {
     // Probe local companion server (for desktop/LAN persistence)
     const lanOk = await this.providers.local.probeServer();
     store.setSyncState({ lanAvailable: lanOk });
+    appLog.info('Init', `启动完成 | 后端=${store.settings.provider} | 本地伴侣=${lanOk ? '在线' : '离线'} | 平台=${store.settings.platform}`);
 
     // Load cached E2EE salt
     this.e2eeSalt = await db.getKv('e2ee_salt', null);
@@ -366,6 +368,8 @@ export class SyncEngine {
 
     this.syncing = true;
     this._refreshSyncBanner({ errorMessage: '' });
+    const t0 = performance.now();
+    appLog.info('Sync', `开始同步 (${provider.name})`);
 
     try {
       await provider.ensureWorkspace();
@@ -489,6 +493,7 @@ export class SyncEngine {
             } catch (err) {
               failedDownloads++;
               if (!firstErrMsg) firstErrMsg = err?.message || String(err);
+              appLog.error('Sync', `拉取事件 ${rf.name} 失败: ${err?.message || err}`);
               console.warn('[Sync] Failed downloading event', rf.name, err);
               return null;
             }
@@ -511,6 +516,12 @@ export class SyncEngine {
 
       await this.reloadFromDb();
       this.syncing = false;
+      const ms = Math.round(performance.now() - t0);
+      if (failedDownloads > 0) {
+        appLog.warn('Sync', `同步部分失败 (${ms}ms): 上传 ${pushedCount}，拉取 ${pulled.length}，失败 ${failedDownloads} (${firstErrMsg})`);
+      } else {
+        appLog.info('Sync', `同步完成 (${ms}ms): 上传 ${pushedCount}，拉取 ${pulled.length}，远端共 ${remoteFiles.length} 条`);
+      }
       this._refreshSyncBanner({
         lastSyncedAt: Date.now(),
         errorMessage: failedDownloads > 0 ? `有 ${failedDownloads} 条拉取失败：${firstErrMsg}` : '',
@@ -518,6 +529,7 @@ export class SyncEngine {
       });
       return { ok: failedDownloads === 0, pulled: pulled.length, pushed: pushedCount, failedDownloads };
     } catch (err) {
+      appLog.error('Sync', `同步异常中断: ${err?.message || err}`);
       console.error('[SyncEngine]', err);
       this.syncing = false;
       this._refreshSyncBanner({ errorMessage: err.message || '同步失败' });

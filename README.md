@@ -11,9 +11,11 @@
 
 ## 快速开始
 
-### 1. Windows（零配置立刻启动）
-- **宽屏工作台模式**：双击 [`desktop/start-windows.bat`](desktop/start-windows.bat)
-- **Edge Drop 窄侧栏模式**（430×840 悬浮感窗口）：双击 [`desktop/start-windows-panel.bat`](desktop/start-windows-panel.bat)
+### 1. Windows（零黑框后台静默启动 + 快捷方式）
+- **安装桌面与开始菜单快捷方式**：双击 [`desktop/install-windows-shortcuts.bat`](desktop/install-windows-shortcuts.bat)（直接调用 `pythonw.exe` 零终端黑框启动，带蓝色水滴图标）
+- **宽屏工作台模式**：双击桌面 `CloudDrop` 图标或 [`desktop/start-windows.bat`](desktop/start-windows.bat)
+- **Edge Drop 窄侧栏模式**（430×840 悬浮感窗口）：从开始菜单点 `CloudDrop Panel` 或双击 [`desktop/start-windows-panel.bat`](desktop/start-windows-panel.bat)
+- **运行日志与排错**：点击左侧边栏底部终端图标（或「设置 → 运行日志」）即可查看前后端实时日志、一键复制/导出或停止后台服务；本地持久化日志位于 `%USERPROFILE%\.clouddrop\logs\clouddrop.log`
 - **开启同 Wi-Fi 局域网免云盘直连**（供 Android / Linux 同局域网秒连）：
   ```powershell
   python desktop\clouddrop.py --lan

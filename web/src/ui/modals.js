@@ -7,8 +7,12 @@ import { getAppRedirectUri } from '../providers/base.js';
 import { ICONS } from './icons.js';
 import { escapeHtml } from './markdown.js';
 import { showToast } from './toast.js';
+import { appLog } from './logger.js';
 
 let activeTab = 'cloud';
+let logFilter = 'all'; // 'all' | 'error' | 'backend'
+let cachedBackendLines = [];
+let cachedBackendLogPath = '';
 
 export function openSettingsModal(tab = 'cloud') {
   activeTab = tab;
@@ -43,7 +47,8 @@ export function renderSettingsModal() {
     { id: 'cloud', label: '云盘同步' },
     { id: 'appearance', label: '外观与排版' },
     { id: 'e2ee', label: '端到端加密' },
-    { id: 'device', label: '设备与备份' }
+    { id: 'device', label: '设备与备份' },
+    { id: 'logs', label: '运行日志' }
   ];
 
   tabsEl.innerHTML = tabs
@@ -63,6 +68,7 @@ export function renderSettingsModal() {
   if (activeTab === 'cloud') renderCloudTab(bodyEl);
   else if (activeTab === 'appearance') renderAppearanceTab(bodyEl);
   else if (activeTab === 'e2ee') renderE2eeTab(bodyEl);
+  else if (activeTab === 'logs') renderLogsTab(bodyEl);
   else renderDeviceTab(bodyEl);
 }
 
@@ -505,5 +511,143 @@ function renderDeviceTab(bodyEl) {
   document.getElementById('btn-clear-cache')?.addEventListener('click', async () => {
     await syncEngine.clearLocalCache();
     showToast('本机缓存已清空', 'info');
+  });
+}
+
+async function fetchBackendLogs() {
+  try {
+    const res = await fetch('/api/logs?tail=300', { cache: 'no-store' });
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (data && data.ok) {
+      cachedBackendLines = Array.isArray(data.lines) ? data.lines : [];
+      cachedBackendLogPath = data.logPath || '';
+      return true;
+    }
+  } catch {
+    // static PWA without desktop companion
+  }
+  return false;
+}
+
+function renderLogLinesHtml() {
+  if (logFilter === 'backend') {
+    if (!cachedBackendLines.length) {
+      return '<div style="color:var(--dsw-alias-ink-tertiary);padding:8px;">暂无桌面后端日志（仅在 Windows / Linux 桌面伴侣运行时产生）。</div>';
+    }
+    return cachedBackendLines
+      .map((line) => {
+        const lvl = line.includes('[ERROR]') ? 'ERROR' : line.includes('[WARNING]') ? 'WARN' : 'INFO';
+        return `<div class="log-line"><span class="log-lvl ${lvl}">${lvl}</span><span class="log-msg">${escapeHtml(line)}</span></div>`;
+      })
+      .join('');
+  }
+
+  const list = appLog.getEntries(logFilter);
+  if (!list.length) {
+    return '<div style="color:var(--dsw-alias-ink-tertiary);padding:8px;">当前筛选下暂无日志记录。</div>';
+  }
+  return list
+    .map(
+      (e) =>
+        `<div class="log-line">` +
+        `<span class="log-ts">${escapeHtml(e.time)}</span>` +
+        `<span class="log-lvl ${escapeHtml(e.level)}">${escapeHtml(e.level)}</span>` +
+        `<span class="log-scope">[${escapeHtml(e.scope)}]</span>` +
+        `<span class="log-msg">${escapeHtml(e.message)}</span>` +
+        `</div>`
+    )
+    .join('');
+}
+
+async function renderLogsTab(bodyEl) {
+  const hasDesktop = syncEngine.providers.local.serverAvailable || (await fetchBackendLogs());
+  if (hasDesktop && !cachedBackendLogPath) {
+    await fetchBackendLogs();
+  }
+
+  bodyEl.innerHTML = `
+    <div class="log-toolbar">
+      <div class="segmented" id="seg-log-filter">
+        <button type="button" data-log-filter="all" class="${logFilter === 'all' ? 'active' : ''}">前端日志</button>
+        <button type="button" data-log-filter="error" class="${logFilter === 'error' ? 'active' : ''}">仅警告/错误</button>
+        ${hasDesktop ? `<button type="button" data-log-filter="backend" class="${logFilter === 'backend' ? 'active' : ''}">桌面后端日志</button>` : ''}
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn btn-secondary btn-sm" id="btn-log-refresh" type="button">刷新</button>
+        <button class="btn btn-secondary btn-sm" id="btn-log-copy" type="button">复制全部</button>
+        <button class="btn btn-secondary btn-sm" id="btn-log-export" type="button">导出 .log</button>
+        <button class="btn btn-danger btn-sm" id="btn-log-clear" type="button">清空</button>
+      </div>
+    </div>
+
+    <div class="log-console" id="log-console">${renderLogLinesHtml()}</div>
+
+    ${
+      hasDesktop
+        ? `<div class="settings-row" style="padding-bottom:0;">
+            <div>
+              <div style="font-weight:600;font-size:12.5px;">桌面后台日志文件（自动脱敏滚动保存）</div>
+              <div class="form-help" style="font-family:var(--dsw-font-code);word-break:break-all;">${escapeHtml(
+                cachedBackendLogPath || '~/.clouddrop/logs/clouddrop.log'
+              )}</div>
+            </div>
+            <button class="btn btn-danger btn-sm" id="btn-stop-daemon" type="button">退出后台服务</button>
+          </div>`
+        : `<div class="form-help">提示：日志会自动对 Token/密钥脱敏，遇到异常可直接点击「复制全部」发给开发者定位。</div>`
+    }
+  `;
+
+  const consoleEl = document.getElementById('log-console');
+  if (consoleEl) consoleEl.scrollTop = consoleEl.scrollHeight;
+
+  bodyEl.querySelectorAll('#seg-log-filter button').forEach((b) => {
+    b.addEventListener('click', async () => {
+      logFilter = b.getAttribute('data-log-filter');
+      if (logFilter === 'backend') await fetchBackendLogs();
+      renderLogsTab(bodyEl);
+    });
+  });
+
+  document.getElementById('btn-log-refresh')?.addEventListener('click', async () => {
+    if (hasDesktop) await fetchBackendLogs();
+    renderLogsTab(bodyEl);
+    showToast('日志已刷新', 'info', 1200);
+  });
+
+  document.getElementById('btn-log-copy')?.addEventListener('click', async () => {
+    if (hasDesktop) await fetchBackendLogs();
+    const text = appLog.formatPlainText(cachedBackendLines);
+    await navigator.clipboard.writeText(text);
+    showToast('已复制全部脱敏诊断日志', 'success', 1800);
+  });
+
+  document.getElementById('btn-log-export')?.addEventListener('click', async () => {
+    if (hasDesktop) await fetchBackendLogs();
+    const text = appLog.formatPlainText(cachedBackendLines);
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `clouddrop-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.log`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  });
+
+  document.getElementById('btn-log-clear')?.addEventListener('click', async () => {
+    appLog.clear();
+    if (hasDesktop) {
+      await fetch('/api/logs/clear', { method: 'POST' }).catch(() => {});
+      cachedBackendLines = [];
+    }
+    renderLogsTab(bodyEl);
+    showToast('运行日志已清空', 'info', 1500);
+  });
+
+  document.getElementById('btn-stop-daemon')?.addEventListener('click', async () => {
+    await fetch('/api/shutdown', { method: 'POST' }).catch(() => {});
+    showToast('桌面后台服务已安全停止，可直接关闭窗口', 'info', 4000);
   });
 }

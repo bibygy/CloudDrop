@@ -192,6 +192,7 @@ function bindGlobalUiEvents() {
   setIcon('btn-sync', ICONS.sync);
   setIcon('btn-compact', ICONS.panelRight);
   setIcon('btn-settings-top', ICONS.settings);
+  setIcon('btn-logs-side', ICONS.terminal);
   setIcon('btn-settings-side', ICONS.settings);
   setIcon('btn-attach', ICONS.paperclip);
   setIcon('btn-paste', ICONS.clipboard);
@@ -216,8 +217,12 @@ function bindGlobalUiEvents() {
   // E2EE badge -> open E2EE tab
   document.getElementById('e2ee-badge')?.addEventListener('click', () => openSettingsModal('e2ee'));
 
-  // Settings buttons
+  // Settings & Logs buttons
   document.getElementById('btn-settings-top')?.addEventListener('click', () => openSettingsModal('cloud'));
+  document.getElementById('btn-logs-side')?.addEventListener('click', () => {
+    toggleDrawer(false);
+    openSettingsModal('logs');
+  });
   document.getElementById('btn-settings-side')?.addEventListener('click', () => {
     toggleDrawer(false);
     openSettingsModal('appearance');

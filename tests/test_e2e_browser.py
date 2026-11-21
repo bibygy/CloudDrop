@@ -300,6 +300,13 @@ def run_e2e(screenshot_dir: Path | None = None) -> None:
             od_text = cdp.eval("document.getElementById('settings-body').innerText")
             assert "Microsoft Entra" in od_text and "OneDrive" in od_text
 
+            # Switch modal to built-in Runtime Logs tab & capture screenshot
+            cdp.eval("document.querySelector('[data-modal-tab=\"logs\"]').click()")
+            time.sleep(0.3)
+            log_text = cdp.eval("document.getElementById('log-console')?.innerText || ''")
+            assert "Sync" in log_text or "Init" in log_text, f"Expected runtime logs in console, got: {log_text}"
+            cdp.screenshot(screenshot_dir / "05_runtime_logs_modal.png")
+
             # Close modal and test E2EE encryption round-trip!
             cdp.eval("document.getElementById('settings-close').click()")
             time.sleep(0.15)

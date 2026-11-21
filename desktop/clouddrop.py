@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import logging.handlers
 import mimetypes
 import os
 import platform
@@ -33,6 +35,45 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT_DIR / "web"
+LOG_DIR = Path.home() / ".clouddrop" / "logs"
+LOG_FILE = LOG_DIR / "clouddrop.log"
+
+logger = logging.getLogger("clouddrop")
+
+
+def setup_logging(log_file: Path | None = None) -> Path:
+    target = log_file or LOG_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh = logging.handlers.RotatingFileHandler(
+        target, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    if sys.stdout is not None:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+
+    def _log_excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        logger.error("未捕获异常", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = _log_excepthook
+    return target
+
+
+def safe_url_label(raw_url: str) -> str:
+    try:
+        u = urllib.parse.urlparse(raw_url)
+        return f"{u.hostname}{u.path[:64]}"
+    except Exception:
+        return "<invalid-url>"
 
 # Ensure crisp MIME types across Windows/Linux registries
 mimetypes.init()
@@ -95,13 +136,14 @@ class CloudDropServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, server_address, data_dir: Path, lan_url: str | None):
+    def __init__(self, server_address, data_dir: Path, lan_url: str | None, log_file: Path | None = None):
         self.data_dir = data_dir
         self.events_dir = data_dir / "events"
         self.files_dir = data_dir / "files"
         self.events_dir.mkdir(parents=True, exist_ok=True)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         self.lan_url = lan_url
+        self.log_file = log_file or LOG_FILE
         super().__init__(server_address, CloudDropHandler)
 
 
@@ -130,9 +172,16 @@ class CloudDropHandler(BaseHTTPRequestHandler):
     def _send_status(self, status: int, message: str = "") -> None:
         self._send_json({"ok": status < 400, "error": message} if message else {"ok": status < 400}, status=status)
 
+    def _is_loopback(self) -> bool:
+        return self.client_address[0] in ("127.0.0.1", "::1", "localhost")
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if path == "/api/logs":
+            self._handle_logs_get(parsed.query)
+            return
 
         if path == "/api/onedrive-proxy":
             self._handle_onedrive_proxy_get(parsed.query)
@@ -147,6 +196,16 @@ class CloudDropHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         self._serve_static(parsed.path, head_only=True)
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/logs/clear":
+            self._handle_logs_clear()
+            return
+        if parsed.path == "/api/shutdown":
+            self._handle_shutdown()
+            return
+        self._send_status(405, "Method Not Allowed")
 
     def do_PUT(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -165,14 +224,58 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             return
         self._send_status(405, "Method Not Allowed")
 
+    # ---- Diagnostics Logs & Lifecycle Endpoints (Loopback Only) ----
+
+    def _handle_logs_get(self, query: str) -> None:
+        if not self._is_loopback():
+            self._send_status(403, "Forbidden")
+            return
+        srv: CloudDropServer = self.server  # type: ignore
+        qs = urllib.parse.parse_qs(query)
+        try:
+            tail = max(20, min(1000, int((qs.get("tail") or ["250"])[0])))
+        except ValueError:
+            tail = 250
+        lines: list[str] = []
+        if srv.log_file.is_file():
+            try:
+                all_lines = srv.log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = all_lines[-tail:]
+            except Exception as exc:
+                lines = [f"[ERROR] 读取日志文件失败: {exc}"]
+        self._send_json({"ok": True, "logPath": str(srv.log_file), "lines": lines})
+
+    def _handle_logs_clear(self) -> None:
+        if not self._is_loopback():
+            self._send_status(403, "Forbidden")
+            return
+        srv: CloudDropServer = self.server  # type: ignore
+        try:
+            srv.log_file.parent.mkdir(parents=True, exist_ok=True)
+            srv.log_file.write_text("", encoding="utf-8")
+            logger.info("日志已由用户清空")
+            self._send_json({"ok": True})
+        except Exception as exc:
+            self._send_status(500, f"清空日志失败: {exc}")
+
+    def _handle_shutdown(self) -> None:
+        if not self._is_loopback():
+            self._send_status(403, "Forbidden")
+            return
+        logger.info("收到前端退出后台服务指令，即将安全关闭 CloudDrop")
+        self._send_json({"ok": True})
+        threading.Timer(0.2, self.server.shutdown).start()
+
     # ---- CORS-Free OneDrive Download/Upload Proxy (Strictly Allow-Listed) ----
 
     def _handle_onedrive_proxy_get(self, query: str) -> None:
         qs = urllib.parse.parse_qs(query)
         target = (qs.get("url") or [""])[0]
         if not is_allowed_onedrive_url(target):
+            logger.warning("拦截非法代理目标: %s", safe_url_label(target))
             self._send_status(403, "Disallowed proxy host")
             return
+        t0 = time.monotonic()
         try:
             req = urllib.request.Request(target, headers={"User-Agent": "CloudDrop/1.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -185,8 +288,11 @@ class CloudDropHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+            ms = int((time.monotonic() - t0) * 1000)
+            logger.info("OneDrive 代理 GET %s -> %d (%d B, %dms)", safe_url_label(target), resp.status, len(data), ms)
         except urllib.error.HTTPError as exc:
             err_body = exc.read()
+            logger.warning("OneDrive 代理 GET %s -> HTTP %d", safe_url_label(target), exc.code)
             self.send_response(exc.code)
             self._send_common_headers()
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -194,12 +300,14 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(err_body)
         except Exception as exc:
+            logger.error("OneDrive 代理 GET 失败 (%s): %s", safe_url_label(target), exc)
             self._send_status(502, f"OneDrive proxy failed: {exc}")
 
     def _handle_onedrive_proxy_put(self, query: str) -> None:
         qs = urllib.parse.parse_qs(query)
         target = (qs.get("url") or [""])[0]
         if not is_allowed_onedrive_url(target):
+            logger.warning("拦截非法上传代理目标: %s", safe_url_label(target))
             self._send_status(403, "Disallowed proxy host")
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -209,6 +317,7 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             val = self.headers.get(hdr)
             if val:
                 fwd_headers[hdr] = val
+        t0 = time.monotonic()
         try:
             req = urllib.request.Request(target, data=body, method="PUT", headers=fwd_headers)
             with urllib.request.urlopen(req, timeout=60) as resp:
@@ -219,8 +328,11 @@ class CloudDropHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+            ms = int((time.monotonic() - t0) * 1000)
+            logger.info("OneDrive 上传代理 PUT %s -> %d (%d B, %dms)", safe_url_label(target), resp.status, len(body), ms)
         except urllib.error.HTTPError as exc:
             err_body = exc.read()
+            logger.warning("OneDrive 上传代理 PUT %s -> HTTP %d", safe_url_label(target), exc.code)
             self.send_response(exc.code)
             self._send_common_headers()
             self.send_header("Content-Type", "application/json")
@@ -228,6 +340,7 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(err_body)
         except Exception as exc:
+            logger.error("OneDrive 上传代理 PUT 失败 (%s): %s", safe_url_label(target), exc)
             self._send_status(502, f"OneDrive upload proxy failed: {exc}")
 
     # ---- Local / LAN Sync REST API ----
@@ -506,16 +619,18 @@ def is_clouddrop_running(port: int) -> bool:
 
 
 def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-    if hasattr(sys.stderr, "reconfigure"):
+    if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
         try:
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    log_path = setup_logging()
 
     parser = argparse.ArgumentParser(description="CloudDrop — 跨端清爽云端投递箱 (Windows / Linux / Android)")
     parser.add_argument("--port", type=int, default=4173, help="本地服务端口（默认 4173）")
@@ -531,14 +646,14 @@ def main() -> int:
     args = parser.parse_args()
 
     if not WEB_DIR.is_dir():
-        print(f"[CloudDrop] 未找到前端资源目录: {WEB_DIR}", file=sys.stderr)
+        logger.error("未找到前端资源目录: %s", WEB_DIR)
         return 1
 
     local_url = f"http://localhost:{args.port}" + ("/?panel=1" if args.panel else "")
 
     # If CloudDrop is already running on this port, simply open a new window instead of failing
     if is_clouddrop_running(args.port):
-        print(f"[CloudDrop] 检测到后台已在运行 ({local_url})，直接打开窗口...")
+        logger.info("检测到后台已在运行 (%s)，直接打开应用窗口", local_url)
         if not args.no_browser:
             launch_app_window(local_url, args.panel)
         return 0
@@ -549,20 +664,14 @@ def main() -> int:
 
     data_dir = Path(args.data_dir).expanduser().resolve()
     try:
-        server = CloudDropServer((bind_host, args.port), data_dir=data_dir, lan_url=lan_url)
+        server = CloudDropServer((bind_host, args.port), data_dir=data_dir, lan_url=lan_url, log_file=log_path)
     except OSError as exc:
-        print(f"[CloudDrop] 端口 {args.port} 启动失败: {exc}", file=sys.stderr)
-        print(f"[CloudDrop] 提示：可改用其他端口，例如 python desktop/clouddrop.py --port {args.port + 1}", file=sys.stderr)
+        logger.error("端口 %d 启动失败: %s", args.port, exc)
         return 1
 
-    print("============================================================")
-    print("  CloudDrop 已启动 (DeepSeek HARNESS 清爽风格 · 三端互通)")
-    print(f"  本机地址 : {local_url}")
+    logger.info("CloudDrop 已启动 | PID=%d | 本机=%s | 数据=%s | 日志=%s", os.getpid(), local_url, data_dir, log_path)
     if lan_url:
-        print(f"  局域网   : {lan_url}  (手机 Android / Linux 同 Wi-Fi 直接打开)")
-    print(f"  数据目录 : {data_dir}")
-    print("  按 Ctrl+C 停止服务")
-    print("============================================================")
+        logger.info("局域网监听已开启: %s", lan_url)
 
     if not args.no_browser:
         threading.Timer(0.35, launch_app_window, args=(local_url, args.panel)).start()
@@ -570,9 +679,10 @@ def main() -> int:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[CloudDrop] 服务已停止。")
+        logger.info("收到中断信号，CloudDrop 服务已停止")
     finally:
         server.server_close()
+        logger.info("CloudDrop 服务已关闭")
     return 0
 
 

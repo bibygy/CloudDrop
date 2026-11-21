@@ -27,6 +27,7 @@
     "active": true,
     "targets": "all",
     "icon": [
+      "../../web/assets/icon.ico",
       "../../web/assets/icon-512.png"
     ]
   }

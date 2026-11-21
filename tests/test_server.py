@@ -114,3 +114,13 @@ def test_path_traversal_rejected(server):
         assert status == 400
         status, _, _ = req(f"{base}/api/local-sync/files/{bad}")
         assert status == 400
+
+
+def test_windows_batch_launchers_valid_crlf_ascii():
+    for name in ("start-windows.bat", "start-windows-panel.bat"):
+        raw = (ROOT / "desktop" / name).read_bytes()
+        # Must be pure ASCII with CRLF line endings so cmd.exe never breaks on codepage seek
+        raw.decode("ascii")
+        assert b"\r\n" in raw
+        assert b"\n" not in raw.replace(b"\r\n", b"")
+

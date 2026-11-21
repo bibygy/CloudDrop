@@ -31,14 +31,40 @@ chmod +x desktop/start-linux.sh desktop/install-linux-desktop.sh
 ./desktop/install-linux-desktop.sh  # 安装到桌面应用菜单
 ```
 
-### 3. Android
-提供两种原生级使用方式：
-1. **PWA 独立应用（推荐，最轻最快）**：
-   - 将本仓库推送到 GitHub，启用 GitHub Pages（已内置 `.github/workflows/deploy-pwa.yml` 自动部署 `web/`）
-   - 在 Android Chrome 打开你的 Pages 链接 → 点击「安装应用 / 添加到主屏幕」
-   - 即可拥有独立图标，并且自动接入 **Android 系统分享菜单**（Web Share Target），在任意 App 点「分享 → CloudDrop」直接投递文字、链接、图片和文件！
-2. **原生 Android APK**：
-   - 使用 [`platforms/android/`](platforms/android/)（已接入原生 `ACTION_SEND` / `ACTION_SEND_MULTIPLE` 系统分享 Intent），或通过 `.github/workflows/build-native.yml` 一键构建 `.apk`、Windows `.exe`/`.msi`、Linux `.AppImage`/`.deb`。
+### 3. Android 详细部署与 APK 构建教程
+
+你有 **两种方式** 在 Android 上使用 CloudDrop，强烈建议按自己用的云盘选择：
+
+| 对比项 | 方式 A：PWA 独立应用（GitHub Pages） | 方式 B：原生 Android APK（GitHub Actions 云端编译） |
+| :--- | :--- | :--- |
+| 桌面独立图标 + 全屏无地址栏 | 支持 | 支持 |
+| Android 系统「分享」菜单直接投递 | 支持（Web Share Target） | 支持（原生 `ACTION_SEND`） |
+| **Google Drive 登录** | **完美支持**（真 Chrome 内核） | 受限（Google 会拦截 WebView 登录） |
+| **OneDrive 登录** | **完美支持** | 支持 |
+| 电脑是否需要安装 Android Studio | 不需要 | 不需要（GitHub 云端免费编译） |
+
+#### 方式 A：GitHub Pages 一键生成 Android 独立应用（最推荐，5 分钟搞定）
+1. 确认你的 GitHub 仓库根目录下能看到 `.github/workflows/deploy-pwa.yml`（如果之前是在网页拖文件夹上传的，注意隐藏目录 `.github` 可能没传上去，建议用 `git push` 推送完整目录）。
+2. 打开你的 GitHub 仓库 → 顶部 **Settings** → 左侧 **Pages**。
+3. 在 **Build and deployment → Source** 下拉框里选择 **GitHub Actions**。
+4. 切到仓库顶部 **Actions** 标签页 → 左侧点 **Deploy CloudDrop PWA to GitHub Pages** → 点右侧 **Run workflow** 运行（约 30 秒变绿）。
+5. 完成后页面会显示你的专属 HTTPS 地址（如 `https://你的用户名.github.io/仓库名/`）。
+6. 在 Android 手机用 **Chrome** 或 **Edge** 打开该链接 → 点右上角菜单 **「安装应用 / 添加到主屏幕」**，桌面即出现 CloudDrop 图标，且在微信/相册/浏览器点「分享」都能直接选 CloudDrop！
+
+#### 方式 B：用 GitHub Actions 云端免费构建真正的 Android `.apk` 安装包
+1. 先把本次更新后的完整文件（特别是新增的 `platforms/android/gradle.properties` 和 `.github/workflows/build-android-apk.yml`）推送到 GitHub：
+   ```powershell
+   git add .
+   git commit -m "fix android gradle config and windows launcher"
+   git push
+   ```
+2. 打开你的 GitHub 仓库 → 顶部点击 **Actions** 标签页。
+3. 在左侧工作流列表中点击 **Build Android APK**（推送到 `main`/`master` 时会自动运行；如果没有自动跑，点右侧 **Run workflow → Run workflow** 手动触发）。
+4. 等待约 **2~3 分钟**，任务变成绿色对勾 `✓` 后，点进这次运行记录。
+5. 拉到页面最底部的 **Artifacts** 区域，点击下载 **`CloudDrop-Android-APK`**（是一个 `.zip` 压缩包）。
+6. 解压得到 `app-debug.apk`，传到 Android 手机安装即可（文件下载会自动保存到手机 `下载/CloudDrop/` 目录）。
+
+> 提示：若使用 Android APK 连接 **OneDrive**，请在 Azure 门户的 SPA 重定向 URI 中添加 `https://appassets.androidplatform.net/assets/index.html`；若主要用 **Google Drive**，推荐直接采用 **方式 A（Chrome PWA）**，不会被 Google 限制 WebView 登录。
 
 ---
 

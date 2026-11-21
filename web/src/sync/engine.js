@@ -4,6 +4,7 @@
 import { db } from '../state/db.js';
 import { makeId, store } from '../state/store.js';
 import {
+  bytesToBase64,
   createCanary,
   decryptBlob,
   decryptJson,
@@ -556,6 +557,13 @@ export class SyncEngine {
     const blob = await this.getBlobForAttachment(att, { autoDownload: true });
     if (!blob) {
       throw new Error('文件尚未同步到本地，请先连接云盘');
+    }
+    // Inside Android native APK WebView, save directly to Downloads/CloudDrop via AndroidBridge
+    if (window.AndroidBridge && typeof window.AndroidBridge.saveFile === 'function') {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const ok = window.AndroidBridge.saveFile(att.name || 'download', att.mimeType || blob.type || '', bytesToBase64(bytes));
+      if (!ok) throw new Error('保存到手机下载目录失败');
+      return;
     }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

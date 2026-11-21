@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -399,7 +400,29 @@ def launch_app_window(url: str, panel_mode: bool = False) -> None:
         webbrowser.open(url)
 
 
+def is_clouddrop_running(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/local-sync/ping", timeout=1.0) as resp:
+            if resp.status == 200:
+                info = json.loads(resp.read().decode("utf-8"))
+                return bool(info.get("ok") and info.get("app") == "CloudDrop")
+    except Exception:
+        return False
+    return False
+
+
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="CloudDrop — 跨端清爽云端投递箱 (Windows / Linux / Android)")
     parser.add_argument("--port", type=int, default=4173, help="本地服务端口（默认 4173）")
     parser.add_argument("--lan", action="store_true", help="开启局域网监听（0.0.0.0），允许 Android/Linux 同 Wi-Fi 直连")
@@ -417,13 +440,26 @@ def main() -> int:
         print(f"[CloudDrop] 未找到前端资源目录: {WEB_DIR}", file=sys.stderr)
         return 1
 
+    local_url = f"http://localhost:{args.port}" + ("/?panel=1" if args.panel else "")
+
+    # If CloudDrop is already running on this port, simply open a new window instead of failing
+    if is_clouddrop_running(args.port):
+        print(f"[CloudDrop] 检测到后台已在运行 ({local_url})，直接打开窗口...")
+        if not args.no_browser:
+            launch_app_window(local_url, args.panel)
+        return 0
+
     bind_host = "0.0.0.0" if args.lan else "127.0.0.1"
     lan_ip = detect_lan_ip() if args.lan else None
     lan_url = f"http://{lan_ip}:{args.port}" if lan_ip else None
-    local_url = f"http://localhost:{args.port}" + ("/?panel=1" if args.panel else "")
 
     data_dir = Path(args.data_dir).expanduser().resolve()
-    server = CloudDropServer((bind_host, args.port), data_dir=data_dir, lan_url=lan_url)
+    try:
+        server = CloudDropServer((bind_host, args.port), data_dir=data_dir, lan_url=lan_url)
+    except OSError as exc:
+        print(f"[CloudDrop] 端口 {args.port} 启动失败: {exc}", file=sys.stderr)
+        print(f"[CloudDrop] 提示：可改用其他端口，例如 python desktop/clouddrop.py --port {args.port + 1}", file=sys.stderr)
+        return 1
 
     print("============================================================")
     print("  CloudDrop 已启动 (DeepSeek HARNESS 清爽风格 · 三端互通)")

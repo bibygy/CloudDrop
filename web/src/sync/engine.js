@@ -451,13 +451,14 @@ export class SyncEngine {
 
       const pulled = [];
       let failedDownloads = 0;
+      let firstErrMsg = '';
       const CONCURRENCY = 6;
       for (let i = 0; i < toDownload.length; i += CONCURRENCY) {
         const batch = toDownload.slice(i, i + CONCURRENCY);
         const results = await Promise.all(
           batch.map(async (rf) => {
             try {
-              const raw = await provider.downloadEventJson(rf.remoteId, rf.downloadUrl || null);
+              const raw = rf.inlineData || (await provider.downloadEventJson(rf.remoteId, rf.downloadUrl || null));
               if (raw && raw.__e2ee === 1) {
                 if (this.e2eeKey) {
                   const plain = await decryptJson(raw, this.e2eeKey);
@@ -487,6 +488,7 @@ export class SyncEngine {
               return null;
             } catch (err) {
               failedDownloads++;
+              if (!firstErrMsg) firstErrMsg = err?.message || String(err);
               console.warn('[Sync] Failed downloading event', rf.name, err);
               return null;
             }
@@ -511,7 +513,7 @@ export class SyncEngine {
       this.syncing = false;
       this._refreshSyncBanner({
         lastSyncedAt: Date.now(),
-        errorMessage: failedDownloads > 0 ? `有 ${failedDownloads} 条云端记录拉取失败，请重试` : '',
+        errorMessage: failedDownloads > 0 ? `有 ${failedDownloads} 条拉取失败：${firstErrMsg}` : '',
         quota: quota || store.syncState.quota
       });
       return { ok: failedDownloads === 0, pulled: pulled.length, pushed: pushedCount, failedDownloads };

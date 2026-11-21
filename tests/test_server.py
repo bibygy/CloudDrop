@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -123,4 +124,20 @@ def test_windows_batch_launchers_valid_crlf_ascii():
         raw.decode("ascii")
         assert b"\r\n" in raw
         assert b"\n" not in raw.replace(b"\r\n", b"")
+
+
+def test_onedrive_proxy_strict_host_allowlist(server):
+    base, _ = server
+    for bad_url in (
+        "http://127.0.0.1:4173/api/local-sync/ping",
+        "https://evil.example.com/file.json",
+        "https://1drv.com.evil.com/x",
+        "file:///etc/passwd",
+    ):
+        q = urllib.parse.quote(bad_url, safe="")
+        status, _, _ = req(f"{base}/api/onedrive-proxy?url={q}")
+        assert status == 403
+    assert clouddrop.is_allowed_onedrive_url("https://my.microsoftpersonalcontent.com/personal/abc/item") is True
+    assert clouddrop.is_allowed_onedrive_url("https://public.dm.files.1drv.com/y4mTest") is True
+
 

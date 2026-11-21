@@ -347,46 +347,107 @@ export class OneDriveProvider {
     return true;
   }
 
+  _preferLocalProxy() {
+    const h = window.location.hostname;
+    return h === 'appassets.androidplatform.net' || h === 'localhost' || h === '127.0.0.1' || Boolean(this._hasLocalProxy);
+  }
+
+  async _fetchDownloadUrl(downloadUrl) {
+    const proxyUrl = `/api/onedrive-proxy?url=${encodeURIComponent(downloadUrl)}`;
+    const tryProxy = async () => {
+      const pRes = await fetch(proxyUrl, { cache: 'no-store' });
+      if (!pRes.ok) {
+        throw new Error(`OneDrive 代理读取失败 (${pRes.status})`);
+      }
+      this._hasLocalProxy = true;
+      return pRes;
+    };
+
+    // On Android APK (WebViewAssetLoader) and Desktop Companion (clouddrop.py),
+    // go straight through the same-origin local proxy to bypass OneDrive Personal's missing CORS headers.
+    if (this._preferLocalProxy()) {
+      try {
+        return await tryProxy();
+      } catch {
+        // Fallback to direct fetch if static localhost server without proxy
+      }
+    }
+
+    try {
+      const res = await fetch(downloadUrl);
+      if (!res.ok) throw new Error(`OneDrive 下载失败 (${res.status})`);
+      return res;
+    } catch (directErr) {
+      try {
+        return await tryProxy();
+      } catch {
+        throw new Error(
+          `OneDrive 个人版内容域未开放浏览器跨域(CORS)，请使用桌面端或 Android APK 客户端读取 (${directErr?.message || 'CORS'})`
+        );
+      }
+    }
+  }
+
   async readMeta() {
     await this.ensureWorkspace();
-    const res = await this._graphFetch(
-      '/me/drive/root:/CloudDrop/meta.json?$select=id,name,@microsoft.graph.downloadUrl',
-      {},
-      true
-    );
+    const res = await this._graphFetch('/me/drive/root:/CloudDrop/meta.json', {}, true);
     if (!res) return null;
     const meta = await res.json();
+    if (meta.description && meta.description.trim().startsWith('{')) {
+      try {
+        return JSON.parse(meta.description);
+      } catch {
+        // fallback to file download
+      }
+    }
     const dlUrl = meta['@microsoft.graph.downloadUrl'];
     if (!dlUrl) return null;
-    const fileRes = await fetch(dlUrl);
-    if (!fileRes.ok) throw new Error(`OneDrive 读取 meta.json 失败 (${fileRes.status})`);
+    const fileRes = await this._fetchDownloadUrl(dlUrl);
     return fileRes.json();
   }
 
   async writeMeta(meta) {
     await this.ensureWorkspace();
-    await this._graphFetch('/me/drive/root:/CloudDrop/meta.json:/content', {
+    const jsonStr = JSON.stringify(meta, null, 2);
+    const res = await this._graphFetch('/me/drive/root:/CloudDrop/meta.json:/content', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(meta, null, 2)
+      body: jsonStr
     });
+    const saved = await res.json().catch(() => null);
+    if (saved?.id && jsonStr.length <= 3500) {
+      this._graphFetch(`/me/drive/items/${encodeURIComponent(saved.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: jsonStr })
+      }).catch(() => {});
+    }
   }
 
   async listEvents() {
     await this.ensureWorkspace();
     const events = [];
-    let url =
-      '/me/drive/root:/CloudDrop/events:/children?$select=id,name,lastModifiedDateTime,@microsoft.graph.downloadUrl&$top=200';
+    // Omit $select so Graph returns full driveItem including description & @microsoft.graph.downloadUrl
+    let url = '/me/drive/root:/CloudDrop/events:/children?$top=200';
     while (url) {
       const res = await this._graphFetch(url, {}, true);
       if (!res) break;
       const data = await res.json();
       for (const f of data.value || []) {
+        let inlineData = null;
+        if (typeof f.description === 'string' && f.description.trim().startsWith('{')) {
+          try {
+            inlineData = JSON.parse(f.description);
+          } catch {
+            inlineData = null;
+          }
+        }
         events.push({
           remoteId: f.id,
           name: f.name,
           modifiedTime: f.lastModifiedDateTime,
-          downloadUrl: f['@microsoft.graph.downloadUrl'] || null
+          downloadUrl: f['@microsoft.graph.downloadUrl'] || null,
+          inlineData
         });
       }
       url = data['@odata.nextLink'] || null;
@@ -397,34 +458,45 @@ export class OneDriveProvider {
   async downloadEventJson(remoteId, downloadUrl = null) {
     let url = downloadUrl;
     if (!url) {
-      const metaRes = await this._graphFetch(
-        `/me/drive/items/${encodeURIComponent(remoteId)}?$select=id,name,@microsoft.graph.downloadUrl`
-      );
+      const metaRes = await this._graphFetch(`/me/drive/items/${encodeURIComponent(remoteId)}`);
       const meta = await metaRes.json();
+      if (typeof meta.description === 'string' && meta.description.trim().startsWith('{')) {
+        try {
+          return JSON.parse(meta.description);
+        } catch {
+          // continue to downloadUrl
+        }
+      }
       url = meta['@microsoft.graph.downloadUrl'];
     }
     if (!url) {
       throw new Error('OneDrive 未返回事件文件的下载链接');
     }
-    // Fetch pre-authenticated downloadUrl directly WITHOUT Authorization header to avoid 302 CORS preflight block
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw new Error(`OneDrive 下载事件失败 (${res.status})`);
-    }
+    const res = await this._fetchDownloadUrl(url);
     return res.json();
   }
 
   async uploadEventJson(filename, obj) {
     await this.ensureWorkspace();
+    const jsonStr = JSON.stringify(obj);
     const res = await this._graphFetch(
       `/me/drive/root:/CloudDrop/events/${encodeURIComponent(filename)}:/content`,
       {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(obj)
+        body: jsonStr
       }
     );
     const data = await res.json();
+    // Mirror compact event JSON into driveItem.description (served directly by graph.microsoft.com with full CORS!)
+    // so even pure static web browsers / PWAs without local proxy can sync messages with 0 extra requests.
+    if (data?.id && jsonStr.length <= 3500) {
+      this._graphFetch(`/me/drive/items/${encodeURIComponent(data.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: jsonStr })
+      }).catch(() => {});
+    }
     return { remoteId: data.id };
   }
 
@@ -466,14 +538,19 @@ export class OneDriveProvider {
     while (offset < blob.size) {
       const end = Math.min(offset + CHUNK_SIZE, blob.size);
       const chunk = blob.slice(offset, end);
-      const putRes = await fetch(uploadUrl, {
-        method: 'PUT',
-        headers: {
-          'Content-Length': String(chunk.size),
-          'Content-Range': `bytes ${offset}-${end - 1}/${blob.size}`
-        },
-        body: chunk
-      });
+      const headers = {
+        'Content-Range': `bytes ${offset}-${end - 1}/${blob.size}`
+      };
+      let putRes;
+      try {
+        putRes = await fetch(uploadUrl, { method: 'PUT', headers, body: chunk });
+      } catch {
+        putRes = await fetch(`/api/onedrive-upload-proxy?url=${encodeURIComponent(uploadUrl)}`, {
+          method: 'PUT',
+          headers,
+          body: chunk
+        });
+      }
       if (!putRes.ok && putRes.status !== 202) {
         throw new Error(`OneDrive 分片上传失败 (${putRes.status})`);
       }
@@ -487,19 +564,25 @@ export class OneDriveProvider {
   }
 
   async downloadFileBlob(remoteId, onProgress) {
-    const token = await this._ensureToken();
-    // Fetch item metadata to get pre-authenticated @microsoft.graph.downloadUrl (avoids CORS redirect issues!)
     const metaRes = await this._graphFetch(`/me/drive/items/${encodeURIComponent(remoteId)}`);
     const meta = await metaRes.json();
     const dlUrl = meta['@microsoft.graph.downloadUrl'];
-    if (dlUrl) {
-      return xhrDownloadBlob({ url: dlUrl, onProgress });
+    if (!dlUrl) {
+      throw new Error('OneDrive 未返回文件下载链接');
     }
-    return xhrDownloadBlob({
-      url: `${GRAPH_API}/me/drive/items/${encodeURIComponent(remoteId)}/content`,
-      headers: { Authorization: `Bearer ${token}` },
-      onProgress
-    });
+    const proxyUrl = `/api/onedrive-proxy?url=${encodeURIComponent(dlUrl)}`;
+    if (this._preferLocalProxy()) {
+      try {
+        return await xhrDownloadBlob({ url: proxyUrl, onProgress });
+      } catch {
+        // fallback to direct
+      }
+    }
+    try {
+      return await xhrDownloadBlob({ url: dlUrl, onProgress });
+    } catch {
+      return await xhrDownloadBlob({ url: proxyUrl, onProgress });
+    }
   }
 
   async deleteFileBlob(remoteId) {

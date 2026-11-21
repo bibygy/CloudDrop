@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -47,6 +48,27 @@ EXTRA_MIMES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+
+
+ALLOWED_ONEDRIVE_SUFFIXES = (
+    ".1drv.com",
+    ".microsoftpersonalcontent.com",
+    ".sharepoint.com",
+    ".livefilestore.com",
+    ".onedrive.com",
+    ".svc.ms",
+)
+
+
+def is_allowed_onedrive_url(raw_url: str) -> bool:
+    try:
+        u = urllib.parse.urlparse(raw_url)
+        if u.scheme != "https" or not u.hostname:
+            return False
+        host = u.hostname.lower()
+        return host == "graph.microsoft.com" or any(host.endswith(suf) for suf in ALLOWED_ONEDRIVE_SUFFIXES)
+    except Exception:
+        return False
 
 
 def detect_lan_ip() -> str:
@@ -112,6 +134,10 @@ class CloudDropHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/onedrive-proxy":
+            self._handle_onedrive_proxy_get(parsed.query)
+            return
+
         if path.startswith("/api/local-sync/"):
             self._handle_api_get(path)
             return
@@ -124,6 +150,9 @@ class CloudDropHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/onedrive-upload-proxy":
+            self._handle_onedrive_proxy_put(parsed.query)
+            return
         if parsed.path.startswith("/api/local-sync/"):
             self._handle_api_put(parsed.path)
             return
@@ -135,6 +164,71 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             self._handle_api_delete(parsed.path)
             return
         self._send_status(405, "Method Not Allowed")
+
+    # ---- CORS-Free OneDrive Download/Upload Proxy (Strictly Allow-Listed) ----
+
+    def _handle_onedrive_proxy_get(self, query: str) -> None:
+        qs = urllib.parse.parse_qs(query)
+        target = (qs.get("url") or [""])[0]
+        if not is_allowed_onedrive_url(target):
+            self._send_status(403, "Disallowed proxy host")
+            return
+        try:
+            req = urllib.request.Request(target, headers={"User-Agent": "CloudDrop/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+                ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+                self.send_response(resp.status)
+                self._send_common_headers()
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read()
+            self.send_response(exc.code)
+            self._send_common_headers()
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+        except Exception as exc:
+            self._send_status(502, f"OneDrive proxy failed: {exc}")
+
+    def _handle_onedrive_proxy_put(self, query: str) -> None:
+        qs = urllib.parse.parse_qs(query)
+        target = (qs.get("url") or [""])[0]
+        if not is_allowed_onedrive_url(target):
+            self._send_status(403, "Disallowed proxy host")
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length > 0 else b""
+        fwd_headers = {"User-Agent": "CloudDrop/1.0"}
+        for hdr in ("Content-Type", "Content-Range"):
+            val = self.headers.get(hdr)
+            if val:
+                fwd_headers[hdr] = val
+        try:
+            req = urllib.request.Request(target, data=body, method="PUT", headers=fwd_headers)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+                self.send_response(resp.status)
+                self._send_common_headers()
+                self.send_header("Content-Type", resp.headers.get("Content-Type") or "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read()
+            self.send_response(exc.code)
+            self._send_common_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+        except Exception as exc:
+            self._send_status(502, f"OneDrive upload proxy failed: {exc}")
 
     # ---- Local / LAN Sync REST API ----
 

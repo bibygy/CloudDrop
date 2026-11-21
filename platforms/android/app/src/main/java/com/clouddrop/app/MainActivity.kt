@@ -24,8 +24,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.webkit.WebViewAssetLoader
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
@@ -82,6 +85,77 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val allowedOneDriveSuffixes = listOf(
+        ".1drv.com",
+        ".microsoftpersonalcontent.com",
+        ".sharepoint.com",
+        ".livefilestore.com",
+        ".onedrive.com",
+        ".svc.ms"
+    )
+
+    private fun isAllowedOneDriveUrl(rawUrl: String): Boolean {
+        return try {
+            val u = URL(rawUrl)
+            if (u.protocol != "https") return false
+            val host = (u.host ?: "").lowercase()
+            host == "graph.microsoft.com" || allowedOneDriveSuffixes.any { host.endsWith(it) }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun handleOneDriveProxy(targetUrl: String?): WebResourceResponse {
+        val corsHeaders = mapOf(
+            "Access-Control-Allow-Origin" to "https://appassets.androidplatform.net",
+            "Cache-Control" to "no-store"
+        )
+        if (targetUrl.isNullOrBlank() || !isAllowedOneDriveUrl(targetUrl)) {
+            return WebResourceResponse(
+                "text/plain",
+                "UTF-8",
+                403,
+                "Forbidden",
+                corsHeaders,
+                ByteArrayInputStream("Disallowed proxy host".toByteArray())
+            )
+        }
+        return try {
+            val conn = (URL(targetUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                instanceFollowRedirects = true
+                connectTimeout = 20000
+                readTimeout = 30000
+                setRequestProperty("User-Agent", "CloudDrop-Android/1.0")
+            }
+            val code = conn.responseCode
+            val rawType = conn.contentType ?: "application/octet-stream"
+            val mimeType = rawType.substringBefore(";").trim().ifEmpty { "application/octet-stream" }
+            val reason = conn.responseMessage?.ifBlank { null } ?: if (code in 200..299) "OK" else "Error"
+            val stream = if (code in 200..299) conn.inputStream else (conn.errorStream ?: ByteArrayInputStream(ByteArray(0)))
+            val bytes = stream.use { it.readBytes() }
+            conn.disconnect()
+            WebResourceResponse(
+                mimeType,
+                if (mimeType.startsWith("text/") || mimeType == "application/json") "UTF-8" else null,
+                code,
+                reason,
+                corsHeaders,
+                ByteArrayInputStream(bytes)
+            )
+        } catch (e: Exception) {
+            val msg = "Proxy error: ${e.message ?: "network failure"}"
+            WebResourceResponse(
+                "text/plain",
+                "UTF-8",
+                502,
+                "Bad Gateway",
+                corsHeaders,
+                ByteArrayInputStream(msg.toByteArray())
+            )
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -107,6 +181,9 @@ class MainActivity : AppCompatActivity() {
                     val url = request?.url ?: return null
                     if (url.host == "appassets.androidplatform.net") {
                         val path = url.path ?: ""
+                        if (path == "/api/onedrive-proxy") {
+                            return handleOneDriveProxy(url.getQueryParameter("url"))
+                        }
                         if (path.isEmpty() || path == "/" || path == "/assets" || path == "/assets/") {
                             val indexUri = Uri.parse("https://appassets.androidplatform.net/assets/index.html")
                             return assetLoader.shouldInterceptRequest(indexUri)

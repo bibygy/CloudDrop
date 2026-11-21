@@ -10,7 +10,13 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Base64
-import android.webkit.*
+import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -95,32 +101,66 @@ class MainActivity : AppCompatActivity() {
 
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(
-                    view: WebView,
-                    request: WebResourceRequest
+                    view: WebView?,
+                    request: WebResourceRequest?
                 ): WebResourceResponse? {
-                    return assetLoader.shouldInterceptRequest(request.url)
+                    val url = request?.url ?: return null
+                    if (url.host == "appassets.androidplatform.net") {
+                        val path = url.path ?: ""
+                        if (path.isEmpty() || path == "/" || path == "/assets" || path == "/assets/") {
+                            val indexUri = Uri.parse("https://appassets.androidplatform.net/assets/index.html")
+                            return assetLoader.shouldInterceptRequest(indexUri)
+                        }
+                        if (!path.startsWith("/assets/")) {
+                            val fixedUri = Uri.parse("https://appassets.androidplatform.net/assets$path")
+                            return assetLoader.shouldInterceptRequest(fixedUri)
+                        }
+                    }
+                    return assetLoader.shouldInterceptRequest(url)
                 }
 
                 override fun shouldOverrideUrlLoading(
-                    view: WebView,
-                    request: WebResourceRequest
+                    view: WebView?,
+                    request: WebResourceRequest?
                 ): Boolean {
-                    val host = request.url.host ?: return false
-                    if (host == "appassets.androidplatform.net" ||
-                        host.endsWith("microsoftonline.com") ||
-                        host.endsWith("live.com")
+                    val uri = request?.url ?: return false
+                    val host = uri.host ?: return false
+
+                    // Rewrite OAuth callbacks like /assets?code=... to /assets/index.html?code=...
+                    // so WebViewAssetLoader serves index.html and relative ./assets paths resolve cleanly.
+                    if (host == "appassets.androidplatform.net") {
+                        val path = uri.path ?: ""
+                        if (path.isEmpty() || path == "/" || path == "/assets" || path == "/assets/") {
+                            val query = uri.encodedQuery
+                            val fragment = uri.encodedFragment
+                            val target = buildString {
+                                append("https://appassets.androidplatform.net/assets/index.html")
+                                if (!query.isNullOrEmpty()) append("?").append(query)
+                                if (!fragment.isNullOrEmpty()) append("#").append(fragment)
+                            }
+                            view?.loadUrl(target)
+                            return true
+                        }
+                        return false
+                    }
+
+                    if (host.endsWith("microsoftonline.com") ||
+                        host.endsWith("live.com") ||
+                        host.endsWith("msauth.net") ||
+                        host.endsWith("msftauth.net") ||
+                        host.endsWith("microsoft.com")
                     ) {
                         return false
                     }
                     return try {
-                        startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                        startActivity(Intent(Intent.ACTION_VIEW, uri))
                         true
                     } catch (_: Exception) {
                         false
                     }
                 }
 
-                override fun onPageFinished(view: WebView, url: String) {
+                override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
                     pageLoaded = true
                     flushPendingShare()
@@ -129,17 +169,18 @@ class MainActivity : AppCompatActivity() {
 
             webChromeClient = object : WebChromeClient() {
                 override fun onShowFileChooser(
-                    webView: WebView,
-                    callback: ValueCallback<Array<Uri>>,
-                    params: FileChooserParams
+                    webView: WebView?,
+                    filePathCallback: ValueCallback<Array<Uri>>?,
+                    fileChooserParams: FileChooserParams?
                 ): Boolean {
-                    filePathCallback?.onReceiveValue(null)
-                    filePathCallback = callback
+                    this@MainActivity.filePathCallback?.onReceiveValue(null)
+                    this@MainActivity.filePathCallback = filePathCallback
+                    val chooserIntent = fileChooserParams?.createIntent() ?: return false
                     return try {
-                        fileChooserLauncher.launch(params.createIntent())
+                        fileChooserLauncher.launch(chooserIntent)
                         true
                     } catch (_: Exception) {
-                        filePathCallback = null
+                        this@MainActivity.filePathCallback = null
                         false
                     }
                 }

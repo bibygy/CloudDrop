@@ -78,7 +78,8 @@ export class OneDriveProvider {
 
     if (!code || !state.startsWith('od_')) return false;
 
-    const savedRaw = sessionStorage.getItem(PKCE_STATE_KEY);
+    const savedRaw = localStorage.getItem(PKCE_STATE_KEY) || sessionStorage.getItem(PKCE_STATE_KEY);
+    localStorage.removeItem(PKCE_STATE_KEY);
     sessionStorage.removeItem(PKCE_STATE_KEY);
     history.replaceState(null, '', window.location.pathname);
 
@@ -123,10 +124,9 @@ export class OneDriveProvider {
     const { verifier, challenge } = await createPkcePair();
     const state = `od_${base64UrlEncode(crypto.getRandomValues(new Uint8Array(12)))}`;
 
-    sessionStorage.setItem(
-      PKCE_STATE_KEY,
-      JSON.stringify({ state, verifier, clientId: cid, authority: tenant, redirectUri })
-    );
+    const pkceRecord = JSON.stringify({ state, verifier, clientId: cid, authority: tenant, redirectUri, ts: Date.now() });
+    localStorage.setItem(PKCE_STATE_KEY, pkceRecord);
+    sessionStorage.setItem(PKCE_STATE_KEY, pkceRecord);
 
     const authUrl = new URL(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`);
     authUrl.searchParams.set('client_id', cid);
@@ -138,7 +138,11 @@ export class OneDriveProvider {
     authUrl.searchParams.set('code_challenge', challenge);
     authUrl.searchParams.set('code_challenge_method', 'S256');
 
-    if (useRedirect) {
+    const isMobileOrPwa =
+      window.matchMedia('(display-mode: standalone)').matches ||
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+
+    if (useRedirect || isMobileOrPwa) {
       window.location.href = authUrl.toString();
       return false;
     }

@@ -320,15 +320,20 @@ export class OneDriveProvider {
     const createEndpoint = parentPath
       ? `/me/drive/root:/${parentPath}:/children`
       : `/me/drive/root/children`;
-    await this._graphFetch(createEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: folderName,
-        folder: {},
-        '@microsoft.graph.conflictBehavior': 'replace'
-      })
-    });
+    try {
+      await this._graphFetch(createEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: folderName,
+          folder: {},
+          '@microsoft.graph.conflictBehavior': 'fail'
+        })
+      });
+    } catch (err) {
+      // 409 Conflict means another device created the folder concurrently — safe to continue
+      if (!String(err?.message || '').includes('(409)')) throw err;
+    }
   }
 
   async ensureWorkspace() {
@@ -344,9 +349,18 @@ export class OneDriveProvider {
 
   async readMeta() {
     await this.ensureWorkspace();
-    const res = await this._graphFetch('/me/drive/root:/CloudDrop/meta.json:/content', {}, true);
+    const res = await this._graphFetch(
+      '/me/drive/root:/CloudDrop/meta.json?$select=id,name,@microsoft.graph.downloadUrl',
+      {},
+      true
+    );
     if (!res) return null;
-    return res.json();
+    const meta = await res.json();
+    const dlUrl = meta['@microsoft.graph.downloadUrl'];
+    if (!dlUrl) return null;
+    const fileRes = await fetch(dlUrl);
+    if (!fileRes.ok) throw new Error(`OneDrive 读取 meta.json 失败 (${fileRes.status})`);
+    return fileRes.json();
   }
 
   async writeMeta(meta) {
@@ -361,7 +375,8 @@ export class OneDriveProvider {
   async listEvents() {
     await this.ensureWorkspace();
     const events = [];
-    let url = '/me/drive/root:/CloudDrop/events:/children?$select=id,name,lastModifiedDateTime&$top=200';
+    let url =
+      '/me/drive/root:/CloudDrop/events:/children?$select=id,name,lastModifiedDateTime,@microsoft.graph.downloadUrl&$top=200';
     while (url) {
       const res = await this._graphFetch(url, {}, true);
       if (!res) break;
@@ -370,7 +385,8 @@ export class OneDriveProvider {
         events.push({
           remoteId: f.id,
           name: f.name,
-          modifiedTime: f.lastModifiedDateTime
+          modifiedTime: f.lastModifiedDateTime,
+          downloadUrl: f['@microsoft.graph.downloadUrl'] || null
         });
       }
       url = data['@odata.nextLink'] || null;
@@ -378,8 +394,23 @@ export class OneDriveProvider {
     return { events, nextToken: null };
   }
 
-  async downloadEventJson(remoteId) {
-    const res = await this._graphFetch(`/me/drive/items/${encodeURIComponent(remoteId)}/content`);
+  async downloadEventJson(remoteId, downloadUrl = null) {
+    let url = downloadUrl;
+    if (!url) {
+      const metaRes = await this._graphFetch(
+        `/me/drive/items/${encodeURIComponent(remoteId)}?$select=id,name,@microsoft.graph.downloadUrl`
+      );
+      const meta = await metaRes.json();
+      url = meta['@microsoft.graph.downloadUrl'];
+    }
+    if (!url) {
+      throw new Error('OneDrive 未返回事件文件的下载链接');
+    }
+    // Fetch pre-authenticated downloadUrl directly WITHOUT Authorization header to avoid 302 CORS preflight block
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`OneDrive 下载事件失败 (${res.status})`);
+    }
     return res.json();
   }
 

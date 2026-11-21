@@ -370,14 +370,15 @@ export class SyncEngine {
     try {
       await provider.ensureWorkspace();
 
-      // 1. Push local outbox (blobs first, then immutable event JSON)
-      const outbox = await db.getAllOutbox();
-      for (const entry of outbox) {
-        const ev = structuredClone(entry.event);
+      // Helper: push a single event (and its un-uploaded local blobs) to the active provider
+      const pushEventToRemote = async (rawEvent, fileName) => {
+        const ev = structuredClone(rawEvent);
+        ev.remoteFileName = fileName;
         const atts = ev.payload?.attachments || [];
 
         for (const att of atts) {
-          if (att.remoteId) continue;
+          // If switching providers (e.g. local -> onedrive), local remoteId is not valid on cloud drive
+          if (att.remoteId && att.remoteProvider === provider.id) continue;
           const localBlob = await db.getBlob(att.fileId);
           if (!localBlob) continue;
 
@@ -395,30 +396,50 @@ export class SyncEngine {
               (pct) => store.setTransferProgress(att.fileId, { pct, phase: 'upload' })
             );
             att.remoteId = uploaded.remoteId;
+            att.remoteProvider = provider.id;
           } finally {
             store.setTransferProgress(att.fileId, null);
           }
         }
 
-        // Persist updated remoteId back to local event copy
         await db.putEvent(ev);
-
-        // Encrypt event JSON if E2EE unlocked
         const wireObj =
           store.settings.e2eeEnabled && this.e2eeKey
             ? await encryptJson(ev, this.e2eeKey)
             : ev;
+        await provider.uploadEventJson(fileName, wireObj);
+        this.seenRemoteNames.add(fileName);
+      };
 
-        await provider.uploadEventJson(entry.remoteFileName, wireObj);
-        this.seenRemoteNames.add(entry.remoteFileName);
+      // 1. Push local outbox (blobs first, then immutable event JSON)
+      const outbox = await db.getAllOutbox();
+      const justPushedNames = new Set();
+      let pushedCount = 0;
+      for (const entry of outbox) {
+        await pushEventToRemote(entry.event, entry.remoteFileName);
+        justPushedNames.add(entry.remoteFileName);
         await db.removeOutbox(entry.id);
+        pushedCount++;
       }
 
-      // 2. Pull remote events unseen locally
+      // 2. Pull remote events unseen locally & backfill any pre-cloud local events missing from this drive
       const { events: remoteFiles } = await provider.listEvents();
+      const remoteNameSet = new Set(remoteFiles.map((rf) => rf.name).filter(Boolean));
       const localEvents = await db.getAllEvents();
       const knownOpIds = new Set(localEvents.map((e) => e.opId));
       const knownRemoteNames = new Set(localEvents.map((e) => e.remoteFileName).filter(Boolean));
+
+      // Backfill: if user sent notes in Local mode before connecting OneDrive/Google Drive, push them now
+      for (const ev of localEvents) {
+        if (!ev || !ev.opId || ev.__lockedEnvelope) continue;
+        const fname = ev.remoteFileName || `${String(ev.createdAt || Date.now()).padStart(14, '0')}_${ev.opId}.json`;
+        if (!remoteNameSet.has(fname) && !justPushedNames.has(fname)) {
+          await pushEventToRemote(ev, fname);
+          remoteNameSet.add(fname);
+          knownRemoteNames.add(fname);
+          pushedCount++;
+        }
+      }
 
       const toDownload = remoteFiles.filter(
         (rf) =>
@@ -429,13 +450,14 @@ export class SyncEngine {
       );
 
       const pulled = [];
+      let failedDownloads = 0;
       const CONCURRENCY = 6;
       for (let i = 0; i < toDownload.length; i += CONCURRENCY) {
         const batch = toDownload.slice(i, i + CONCURRENCY);
         const results = await Promise.all(
           batch.map(async (rf) => {
             try {
-              const raw = await provider.downloadEventJson(rf.remoteId);
+              const raw = await provider.downloadEventJson(rf.remoteId, rf.downloadUrl || null);
               if (raw && raw.__e2ee === 1) {
                 if (this.e2eeKey) {
                   const plain = await decryptJson(raw, this.e2eeKey);
@@ -443,7 +465,6 @@ export class SyncEngine {
                   plain.remoteFileName = rf.name;
                   return plain;
                 }
-                // Vault is locked: store placeholder so user can unlock with passphrase later
                 const fallbackId = `locked_${rf.name}`;
                 return {
                   opId: fallbackId,
@@ -465,6 +486,7 @@ export class SyncEngine {
               }
               return null;
             } catch (err) {
+              failedDownloads++;
               console.warn('[Sync] Failed downloading event', rf.name, err);
               return null;
             }
@@ -489,10 +511,10 @@ export class SyncEngine {
       this.syncing = false;
       this._refreshSyncBanner({
         lastSyncedAt: Date.now(),
-        errorMessage: '',
+        errorMessage: failedDownloads > 0 ? `有 ${failedDownloads} 条云端记录拉取失败，请重试` : '',
         quota: quota || store.syncState.quota
       });
-      return { ok: true, pulled: pulled.length, pushed: outbox.length };
+      return { ok: failedDownloads === 0, pulled: pulled.length, pushed: pushedCount, failedDownloads };
     } catch (err) {
       console.error('[SyncEngine]', err);
       this.syncing = false;

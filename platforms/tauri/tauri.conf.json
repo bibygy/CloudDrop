@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CloudDrop",
+  "version": "0.1.0",
+  "identifier": "com.clouddrop.app",
+  "build": {
+    "frontendDist": "../../web"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "CloudDrop",
+        "width": 1160,
+        "height": 780,
+        "minWidth": 380,
+        "minHeight": 560,
+        "resizable": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "../../web/assets/icon-512.png"
+    ]
+  }
+}

@@ -1,0 +1,152 @@
+/* ============================================================================
+ * CloudDrop Design Token System
+ * Modeled after DeepSeek HARNESS (--dsw-static-* & --dsw-alias-*)
+ * Strict semantic token discipline: feature styles consume alias tokens only.
+ * ========================================================================== */
+
+:root {
+  /* ---- Static Neutral Cool Slate Scale ---- */
+  --dsw-static-white: #ffffff;
+  --dsw-static-slate-25: #fafbfd;
+  --dsw-static-slate-50: #f8f9fb;
+  --dsw-static-slate-100: #f2f4f8;
+  --dsw-static-slate-150: #ebeff5;
+  --dsw-static-slate-200: #e2e7f0;
+  --dsw-static-slate-300: #cbd3e1;
+  --dsw-static-slate-400: #8e98ab;
+  --dsw-static-slate-500: #636d80;
+  --dsw-static-slate-600: #434b5c;
+  --dsw-static-slate-700: #2a2f3a;
+  --dsw-static-slate-800: #1e2128;
+  --dsw-static-slate-850: #181b21;
+  --dsw-static-slate-900: #14161a;
+  --dsw-static-slate-950: #0f1115;
+
+  /* ---- Static Brand Cobalt (DeepSeek-inspired) ---- */
+  --dsw-static-blue-400: #6e87ff;
+  --dsw-static-blue-500: #5b78ff;
+  --dsw-static-blue-600: #4d6bfe;
+  --dsw-static-blue-700: #3b57e6;
+
+  /* ---- Static Semantic Status ---- */
+  --dsw-static-emerald-500: #10b981;
+  --dsw-static-emerald-600: #059669;
+  --dsw-static-amber-500: #f59e0b;
+  --dsw-static-amber-600: #d97706;
+  --dsw-static-rose-500: #ef4444;
+  --dsw-static-rose-600: #dc2626;
+  --dsw-static-violet-500: #8b5cf6;
+  --dsw-static-cyan-500: #06b6d4;
+
+  /* ---- Typography (Independent UI & Code controls) ---- */
+  --dsw-font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", sans-serif;
+  --dsw-font-code: "JetBrains Mono", "Cascadia Code", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --dsw-font-size-ui: 14px;
+  --dsw-font-size-code: 13px;
+
+  /* ---- Geometry & Motion ---- */
+  --dsw-radius-xs: 6px;
+  --dsw-radius-sm: 8px;
+  --dsw-radius-md: 12px;
+  --dsw-radius-lg: 16px;
+  --dsw-radius-xl: 20px;
+  --dsw-radius-pill: 999px;
+  --dsw-ease: cubic-bezier(0.2, 0, 0, 1);
+  --dsw-dur-fast: 140ms;
+  --dsw-dur-med: 220ms;
+
+  /* ---- Semantic Alias Tokens: LIGHT (Default Crisp Alabaster) ---- */
+  --dsw-alias-bg-base: var(--dsw-static-slate-50);
+  --dsw-alias-bg-sidebar: var(--dsw-static-slate-100);
+  --dsw-alias-bg-surface: var(--dsw-static-white);
+  --dsw-alias-bg-elevated: var(--dsw-static-white);
+  --dsw-alias-bg-subtle: var(--dsw-static-slate-150);
+  --dsw-alias-bg-hover: rgba(15, 23, 42, 0.045);
+  --dsw-alias-bg-active: rgba(77, 107, 254, 0.09);
+  --dsw-alias-bg-glass: rgba(248, 249, 251, 0.82);
+  --dsw-alias-bg-code: #f4f6fa;
+  --dsw-alias-bg-code-header: #ebeff6;
+  --dsw-alias-bg-overlay: rgba(15, 23, 42, 0.34);
+
+  --dsw-alias-ink-primary: #111827;
+  --dsw-alias-ink-secondary: #525c6d;
+  --dsw-alias-ink-tertiary: #8792a6;
+  --dsw-alias-ink-on-accent: #ffffff;
+
+  --dsw-alias-border-hairline: rgba(15, 23, 42, 0.08);
+  --dsw-alias-border-strong: rgba(15, 23, 42, 0.14);
+  --dsw-alias-border-accent: rgba(77, 107, 254, 0.42);
+
+  --dsw-alias-accent: var(--dsw-static-blue-600);
+  --dsw-alias-accent-hover: var(--dsw-static-blue-700);
+  --dsw-alias-accent-soft: rgba(77, 107, 254, 0.10);
+  --dsw-alias-accent-ring: rgba(77, 107, 254, 0.22);
+
+  --dsw-alias-success: var(--dsw-static-emerald-600);
+  --dsw-alias-success-soft: rgba(16, 185, 129, 0.11);
+  --dsw-alias-warning: var(--dsw-static-amber-600);
+  --dsw-alias-warning-soft: rgba(245, 158, 11, 0.12);
+  --dsw-alias-danger: var(--dsw-static-rose-600);
+  --dsw-alias-danger-soft: rgba(239, 68, 68, 0.10);
+
+  --dsw-alias-shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --dsw-alias-shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.05), 0 1px 2px rgba(15, 23, 42, 0.03);
+  --dsw-alias-shadow-md: 0 8px 24px rgba(15, 23, 42, 0.08), 0 2px 6px rgba(15, 23, 42, 0.04);
+  --dsw-alias-shadow-lg: 0 20px 50px rgba(15, 23, 42, 0.16);
+
+  /* Code highlight tokens (light) */
+  --dsw-code-kw: #4d6bfe;
+  --dsw-code-str: #0f766e;
+  --dsw-code-num: #b45309;
+  --dsw-code-cmt: #8792a6;
+  --dsw-code-fn: #6d28d9;
+}
+
+/* ---- Semantic Alias Tokens: DARK (Restrained Charcoal Off-Black) ---- */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --dsw-alias-bg-base: var(--dsw-static-slate-900);
+  --dsw-alias-bg-sidebar: var(--dsw-static-slate-950);
+  --dsw-alias-bg-surface: var(--dsw-static-slate-850);
+  --dsw-alias-bg-elevated: var(--dsw-static-slate-800);
+  --dsw-alias-bg-subtle: #222630;
+  --dsw-alias-bg-hover: rgba(255, 255, 255, 0.055);
+  --dsw-alias-bg-active: rgba(91, 120, 255, 0.15);
+  --dsw-alias-bg-glass: rgba(20, 22, 26, 0.82);
+  --dsw-alias-bg-code: #12141a;
+  --dsw-alias-bg-code-header: #191c24;
+  --dsw-alias-bg-overlay: rgba(0, 0, 0, 0.62);
+
+  --dsw-alias-ink-primary: #eceff4;
+  --dsw-alias-ink-secondary: #9aa4b5;
+  --dsw-alias-ink-tertiary: #667085;
+  --dsw-alias-ink-on-accent: #ffffff;
+
+  --dsw-alias-border-hairline: rgba(255, 255, 255, 0.075);
+  --dsw-alias-border-strong: rgba(255, 255, 255, 0.14);
+  --dsw-alias-border-accent: rgba(91, 120, 255, 0.50);
+
+  --dsw-alias-accent: var(--dsw-static-blue-500);
+  --dsw-alias-accent-hover: var(--dsw-static-blue-400);
+  --dsw-alias-accent-soft: rgba(91, 120, 255, 0.15);
+  --dsw-alias-accent-ring: rgba(91, 120, 255, 0.28);
+
+  --dsw-alias-success: #34d399;
+  --dsw-alias-success-soft: rgba(52, 211, 153, 0.13);
+  --dsw-alias-warning: #fbbf24;
+  --dsw-alias-warning-soft: rgba(251, 191, 36, 0.14);
+  --dsw-alias-danger: #f87171;
+  --dsw-alias-danger-soft: rgba(248, 113, 113, 0.14);
+
+  --dsw-alias-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.24);
+  --dsw-alias-shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.28);
+  --dsw-alias-shadow-md: 0 10px 28px rgba(0, 0, 0, 0.42);
+  --dsw-alias-shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.62);
+
+  /* Code highlight tokens (dark) */
+  --dsw-code-kw: #7c98ff;
+  --dsw-code-str: #5eead4;
+  --dsw-code-num: #fbbf24;
+  --dsw-code-cmt: #667085;
+  --dsw-code-fn: #c4b5fd;
+}

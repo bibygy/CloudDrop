@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="cd-bg" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5B78FF"/>
+      <stop offset="100%" stop-color="#3B54E6"/>
+    </linearGradient>
+    <linearGradient id="cd-drop" x1="256" y1="120" x2="256" y2="396" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E6ECFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#cd-bg)"/>
+  <!-- Clean geometric droplet + sync stream arc -->
+  <path d="M256 116C256 116 154 226 154 294C154 350.333 199.667 396 256 396C312.333 396 358 350.333 358 294C358 226 256 116 256 116Z" fill="url(#cd-drop)"/>
+  <!-- Inner sync arrow cut -->
+  <path d="M256 226V324M256 324L216 284M256 324L296 284" stroke="#4D6BFE" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

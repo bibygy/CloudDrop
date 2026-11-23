@@ -1,7 +1,10 @@
 package com.clouddrop.app
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -40,12 +43,50 @@ class MainActivity : AppCompatActivity() {
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-        filePathCallback?.onReceiveValue(uris)
+        val callback = filePathCallback
         filePathCallback = null
+        if (callback == null) return@registerForActivityResult
+
+        if (result.resultCode != RESULT_OK || result.data == null) {
+            callback.onReceiveValue(null)
+            return@registerForActivityResult
+        }
+
+        val data = result.data!!
+        val uris = mutableListOf<Uri>()
+
+        // Multi-select results are returned in clipData (FileChooserParams.parseResult ignores clipData!)
+        val clip = data.clipData
+        if (clip != null && clip.itemCount > 0) {
+            for (i in 0 until clip.itemCount) {
+                clip.getItemAt(i)?.uri?.let { uris.add(it) }
+            }
+        } else {
+            data.data?.let { uris.add(it) }
+        }
+
+        if (uris.isEmpty()) {
+            val fallback = WebChromeClient.FileChooserParams.parseResult(result.resultCode, data)
+            callback.onReceiveValue(fallback)
+        } else {
+            callback.onReceiveValue(uris.toTypedArray())
+        }
     }
 
     private inner class AndroidBridge {
+        @JavascriptInterface
+        fun copyText(text: String): Boolean {
+            return try {
+                runOnUiThread {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("CloudDrop", text))
+                }
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+
         @JavascriptInterface
         fun saveFile(fileName: String, mimeType: String, base64Data: String): Boolean {
             return try {
@@ -252,9 +293,19 @@ class MainActivity : AppCompatActivity() {
                 ): Boolean {
                     this@MainActivity.filePathCallback?.onReceiveValue(null)
                     this@MainActivity.filePathCallback = filePathCallback
-                    val chooserIntent = fileChooserParams?.createIntent() ?: return false
+                    val allowMultiple =
+                        fileChooserParams?.mode == FileChooserParams.MODE_OPEN_MULTIPLE
+                    val pickerIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, allowMultiple)
+                        val accepts = fileChooserParams?.acceptTypes?.filter { it.isNotBlank() }
+                        if (!accepts.isNullOrEmpty() && !accepts.contains("*/*")) {
+                            putExtra(Intent.EXTRA_MIME_TYPES, accepts.toTypedArray())
+                        }
+                    }
                     return try {
-                        fileChooserLauncher.launch(chooserIntent)
+                        fileChooserLauncher.launch(Intent.createChooser(pickerIntent, "选择文件"))
                         true
                     } catch (_: Exception) {
                         this@MainActivity.filePathCallback = null

@@ -3,6 +3,13 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val persistentKeystore = file("clouddrop-signing.jks")
+val hasPersistentKeystore = persistentKeystore.exists()
+val ksPassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")?.ifBlank { null } ?: "clouddrop"
+val ksAlias = System.getenv("ANDROID_KEY_ALIAS")?.ifBlank { null } ?: "clouddrop"
+val ksKeyPassword = System.getenv("ANDROID_KEY_PASSWORD")?.ifBlank { null } ?: ksPassword
+val ciVersionCode = System.getenv("ANDROID_VERSION_CODE")?.toIntOrNull() ?: 1
+
 android {
     namespace = "com.clouddrop.app"
     compileSdk = 35
@@ -11,13 +18,32 @@ android {
         applicationId = "com.clouddrop.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = ciVersionCode
+        versionName = "0.1.$ciVersionCode"
+    }
+
+    signingConfigs {
+        if (hasPersistentKeystore) {
+            create("persistent") {
+                storeFile = persistentKeystore
+                storePassword = ksPassword
+                keyAlias = ksAlias
+                keyPassword = ksKeyPassword
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            if (hasPersistentKeystore) {
+                signingConfig = signingConfigs.getByName("persistent")
+            }
+        }
         release {
             isMinifyEnabled = false
+            if (hasPersistentKeystore) {
+                signingConfig = signingConfigs.getByName("persistent")
+            }
         }
     }
 

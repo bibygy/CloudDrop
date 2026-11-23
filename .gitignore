@@ -8,4 +8,5 @@ platforms/android/.gradle/
 platforms/android/build/
 platforms/android/app/build/
 platforms/android/app/src/main/assets/
+platforms/android/app/*.jks
 platforms/android/local.properties

@@ -33,6 +33,17 @@ jobs:
       - name: Clean stale Android assets before Gradle sync
         run: rm -rf platforms/android/app/src/main/assets
 
+      - name: Decode persistent signing keystore (if configured in Secrets)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > platforms/android/app/clouddrop-signing.jks
+            echo "Persistent signing keystore enabled (supports direct in-place APK upgrades)."
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret configured; falling back to ephemeral debug keystore."
+          fi
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -40,6 +51,11 @@ jobs:
 
       - name: Build CloudDrop Android APK
         working-directory: platforms/android
+        env:
+          ANDROID_VERSION_CODE: ${{ github.run_number }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload CloudDrop APK Artifact

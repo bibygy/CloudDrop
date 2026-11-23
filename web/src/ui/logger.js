@@ -116,3 +116,45 @@ class AppLogger {
 }
 
 export const appLog = new AppLogger();
+
+// Shared one-click diagnostic log exporter (works on Desktop, Web, and Android APK)
+export async function exportDiagnosticLogs() {
+  let backendLines = [];
+  try {
+    const res = await fetch('/api/logs?tail=400', { cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.ok && Array.isArray(data.lines)) {
+        backendLines = data.lines;
+      }
+    }
+  } catch {
+    // static web/APK without desktop companion
+  }
+
+  const text = appLog.formatPlainText(backendLines);
+  const fileName = `clouddrop-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.log`;
+
+  // Inside Android APK, save directly to Downloads/CloudDrop/
+  if (window.AndroidBridge && typeof window.AndroidBridge.saveFile === 'function') {
+    const bytes = new TextEncoder().encode(text);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    const ok = window.AndroidBridge.saveFile(fileName, 'text/plain', btoa(binary));
+    if (ok) return true;
+  }
+
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  return true;
+}

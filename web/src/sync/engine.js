@@ -31,6 +31,7 @@ export class SyncEngine {
     this.e2eeKey = null;
     this.e2eeSalt = null;
     this.syncing = false;
+    this.syncStartedAt = 0;
     this.pollTimer = null;
     this.seenRemoteNames = new Set();
     this.blobUrlCache = new Map(); // fileId -> objectURL
@@ -43,34 +44,46 @@ export class SyncEngine {
   }
 
   async init() {
-    // Handle any OAuth redirect callbacks first
+    // 1. Hydrate local IndexedDB + probe desktop companion in parallel (<20ms)
+    //    so existing messages render immediately and never turn blank during OAuth callbacks!
+    const [salt, , lanOk] = await Promise.all([
+      db.getKv('e2ee_salt', null),
+      this.reloadFromDb(),
+      this.providers.local.probeServer()
+    ]);
+    this.e2eeSalt = salt;
+    store.setSyncState({ lanAvailable: lanOk });
+    this._refreshSyncBanner();
+
+    // 3. Complete any OAuth redirect callbacks (Google Drive / OneDrive)
     const gdriveCb = this.providers.gdrive.handleRedirectCallback();
     let onedriveCb = false;
     try {
       onedriveCb = await this.providers.onedrive.handleRedirectCallback();
     } catch (err) {
+      appLog.error('Auth', `OneDrive 回调失败: ${err?.message || err}`);
       store.setSyncState({ status: 'error', errorMessage: err.message });
     }
 
     if (gdriveCb) store.updateSettings({ provider: 'gdrive' });
     if (onedriveCb) store.updateSettings({ provider: 'onedrive' });
 
-    // Probe local companion server (for desktop/LAN persistence)
-    const lanOk = await this.providers.local.probeServer();
-    store.setSyncState({ lanAvailable: lanOk });
     appLog.info('Init', `启动完成 | 后端=${store.settings.provider} | 本地伴侣=${lanOk ? '在线' : '离线'} | 平台=${store.settings.platform}`);
-
-    // Load cached E2EE salt
-    this.e2eeSalt = await db.getKv('e2ee_salt', null);
-
-    // Hydrate local events & outbox from IndexedDB
-    await this.reloadFromDb();
     this._refreshSyncBanner();
 
-    // Kick off initial sync if connected
+    // 4. Kick off initial sync if connected (with one automatic retry on cold-start network hiccup)
     const provider = this.getActiveProvider();
     if (provider.isConnected()) {
-      this.syncNow({ silent: true });
+      this.syncNow({ silent: true }).then((res) => {
+        if (res && !res.ok && res.reason !== 'not_connected') {
+          setTimeout(() => {
+            if (navigator.onLine && this.getActiveProvider().isConnected()) {
+              appLog.info('Init', '启动首次同步受网络波动影响，正在自动重试...');
+              this.syncNow({ silent: true });
+            }
+          }, 3500);
+        }
+      });
     }
 
     this.restartAutoPoll();
@@ -364,9 +377,16 @@ export class SyncEngine {
       this._refreshSyncBanner();
       return { ok: false, reason: 'not_connected' };
     }
-    if (this.syncing) return { ok: true, skipped: true };
+    if (this.syncing) {
+      // Recover automatically if a previous sync somehow wedged >45s
+      if (Date.now() - this.syncStartedAt < 45000) {
+        return { ok: true, skipped: true };
+      }
+      appLog.warn('Sync', '检测到上一次同步任务超时未释放，已强制重置同步锁');
+    }
 
     this.syncing = true;
+    this.syncStartedAt = Date.now();
     this._refreshSyncBanner({ errorMessage: '' });
     const t0 = performance.now();
     appLog.info('Sync', `开始同步 (${provider.name})`);

@@ -11,7 +11,8 @@ import {
   closeLightbox,
   initLightboxEvents,
   renderChrome,
-  renderStream
+  renderStream,
+  updateTransferProgressDom
 } from './ui/render.js';
 import { closeSettingsModal, initSettingsModal, openSettingsModal } from './ui/modals.js';
 
@@ -34,7 +35,9 @@ function updateComposerState() {
 function autoResizeTextarea(ta) {
   if (!ta) return;
   ta.style.height = 'auto';
-  ta.style.height = `${Math.min(200, Math.max(44, ta.scrollHeight))}px`;
+  const h = Math.min(200, Math.max(44, ta.scrollHeight));
+  ta.style.height = `${h}px`;
+  ta.style.overflowY = ta.scrollHeight > 200 ? 'auto' : 'hidden';
 }
 
 function renderStagedFiles() {
@@ -489,8 +492,12 @@ async function bootstrap() {
   initLightboxEvents();
   initSettingsModal();
 
-  // Subscribe UI to store updates
+  // Subscribe UI to store updates (targeted updates to guarantee zero flicker!)
   store.subscribe((_, reason) => {
+    if (reason === 'progress') {
+      updateTransferProgressDom();
+      return;
+    }
     renderChrome();
     if (reason !== 'sync') {
       renderStream();

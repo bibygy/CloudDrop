@@ -3,13 +3,34 @@
 // Works cleanly with Personal Microsoft Accounts (/consumers) AND Work/School (/common)
 
 import { getAppRedirectUri, xhrDownloadBlob, xhrUpload } from './base.js';
+import { appLog } from '../ui/logger.js';
 
 const TOKEN_STORAGE_KEY = 'clouddrop_onedrive_auth_v1';
 const PKCE_STATE_KEY = 'clouddrop_onedrive_pkce_v1';
+const AUTH_CHANNEL_NAME = 'clouddrop_onedrive_auth_channel';
 const GRAPH_API = 'https://graph.microsoft.com/v1.0';
 const SCOPES = 'Files.ReadWrite User.Read offline_access';
 const SIMPLE_LIMIT = 4 * 1024 * 1024; // 4 MB
 const CHUNK_SIZE = 327680 * 10; // 3.2 MiB (exact multiple of 320 KiB as required by Microsoft Graph)
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error(`请求超时 (${Math.round(timeoutMs / 1000)}s)`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`网络请求超时 (${Math.round(timeoutMs / 1000)}s)`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function base64UrlEncode(bytes) {
   let str = '';
@@ -31,6 +52,7 @@ export class OneDriveProvider {
     this.name = 'OneDrive';
     this.auth = this._loadAuth();
     this.workspaceReady = false;
+    this._refreshPromise = null;
   }
 
   _loadAuth() {
@@ -99,7 +121,22 @@ export class OneDriveProvider {
       redirectUri: saved.redirectUri
     });
 
-    // If opened inside a popup window, notify opener and close!
+    this.workspaceReady = false;
+    this._refreshPromise = null;
+    appLog.info('OneDrive', 'OAuth 授权回调换取令牌成功');
+
+    // Notify main window via BroadcastChannel (works even when Microsoft COOP severs window.opener!)
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        const ch = new BroadcastChannel(AUTH_CHANNEL_NAME);
+        ch.postMessage({ type: 'clouddrop_onedrive_auth_done', auth: this.auth });
+        ch.close();
+      }
+    } catch {
+      // ignore BroadcastChannel error
+    }
+
+    // If opened inside a popup window, also notify opener and close
     if (window.opener && window.opener !== window) {
       try {
         window.opener.postMessage({ type: 'clouddrop_onedrive_auth_done', auth: this.auth }, window.location.origin);
@@ -109,16 +146,20 @@ export class OneDriveProvider {
       }
     }
 
-    await this._fetchProfileAndQuota();
-    await this.ensureWorkspace();
+    // Fetch profile & workspace best-effort so callback never stalls or blanks the UI
+    await this._fetchProfileAndQuota().catch(() => {});
+    await this.ensureWorkspace().catch((e) => appLog.warn('OneDrive', `回调后初始化目录延迟: ${e?.message || e}`));
     return true;
   }
 
-  async connect({ clientId, authority = 'consumers', useRedirect = false } = {}) {
+  async connect({ clientId, authority = 'consumers', useRedirect = false, reauth = false } = {}) {
     const cid = (clientId || this.auth?.clientId || '').trim();
     if (!cid) {
       throw new Error('请先填写 Microsoft Entra (Azure) 应用 Client ID');
     }
+    this.workspaceReady = false;
+    this._refreshPromise = null;
+
     const tenant = authority === 'common' ? 'common' : 'consumers';
     const redirectUri = getAppRedirectUri();
     const { verifier, challenge } = await createPkcePair();
@@ -137,17 +178,23 @@ export class OneDriveProvider {
     authUrl.searchParams.set('state', state);
     authUrl.searchParams.set('code_challenge', challenge);
     authUrl.searchParams.set('code_challenge_method', 'S256');
+    if (reauth || this.isConnected()) {
+      authUrl.searchParams.set('prompt', 'select_account');
+    }
 
     const isMobileOrPwa =
       window.matchMedia('(display-mode: standalone)').matches ||
       /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+
+    appLog.info('OneDrive', `发起授权 (mode=${useRedirect || isMobileOrPwa ? 'redirect' : 'popup'}, reauth=${Boolean(reauth)})`);
 
     if (useRedirect || isMobileOrPwa) {
       window.location.href = authUrl.toString();
       return false;
     }
 
-    // Try popup first for seamless desktop experience; fallback to redirect if popup blocked
+    // Try popup first for regular desktop web tab; fallback to redirect if popup blocked
+    const startedAt = Date.now();
     const popup = window.open(authUrl.toString(), 'clouddrop_onedrive_oauth', 'width=520,height=660');
     if (!popup) {
       window.location.href = authUrl.toString();
@@ -155,39 +202,85 @@ export class OneDriveProvider {
     }
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let ch = null;
       const cleanup = () => {
         window.removeEventListener('message', onMsg);
+        window.removeEventListener('storage', onStorage);
+        if (ch) {
+          try { ch.close(); } catch {}
+        }
         clearInterval(poll);
+        clearTimeout(timeout);
       };
-      const onMsg = async (ev) => {
-        if (ev.origin !== window.location.origin) return;
-        if (ev.data?.type === 'clouddrop_onedrive_auth_done' && ev.data.auth) {
-          cleanup();
-          this._saveAuth(ev.data.auth);
-          try {
-            await this._fetchProfileAndQuota();
-            await this.ensureWorkspace();
-            resolve(true);
-          } catch (e) {
-            reject(e);
-          }
+
+      const finishWithAuth = async (newAuth) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { if (!popup.closed) popup.close(); } catch {}
+        this._saveAuth(newAuth);
+        this.workspaceReady = false;
+        this._refreshPromise = null;
+        try {
+          await this._fetchProfileAndQuota().catch(() => {});
+          await this.ensureWorkspace();
+          resolve(true);
+        } catch (e) {
+          reject(e);
         }
       };
+
+      const onMsg = (ev) => {
+        if (ev.origin !== window.location.origin) return;
+        if (ev.data?.type === 'clouddrop_onedrive_auth_done' && ev.data.auth) {
+          finishWithAuth(ev.data.auth);
+        }
+      };
+      const onStorage = (ev) => {
+        if (ev.key === TOKEN_STORAGE_KEY && ev.newValue) {
+          try {
+            const parsed = JSON.parse(ev.newValue);
+            if (parsed?.accessToken && (parsed.savedAt || 0) >= startedAt) {
+              finishWithAuth(parsed);
+            }
+          } catch {}
+        }
+      };
+
       window.addEventListener('message', onMsg);
+      window.addEventListener('storage', onStorage);
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          ch = new BroadcastChannel(AUTH_CHANNEL_NAME);
+          ch.onmessage = (ev) => {
+            if (ev.data?.type === 'clouddrop_onedrive_auth_done' && ev.data.auth) {
+              finishWithAuth(ev.data.auth);
+            }
+          };
+        }
+      } catch {}
 
       const poll = setInterval(() => {
         if (popup.closed) {
-          cleanup();
-          // Re-check localStorage in case popup saved tokens before closing
+          if (settled) return;
           const fresh = this._loadAuth();
-          if (fresh && fresh.accessToken) {
-            this.auth = fresh;
-            resolve(true);
+          if (fresh && fresh.accessToken && (fresh.savedAt || 0) >= startedAt) {
+            finishWithAuth(fresh);
           } else {
+            settled = true;
+            cleanup();
             reject(new Error('OneDrive 登录窗口已关闭'));
           }
         }
-      }, 500);
+      }, 450);
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('OneDrive 授权超时，请点击「当前页跳转授权」重试'));
+      }, 120000);
     });
   }
 
@@ -201,11 +294,15 @@ export class OneDriveProvider {
       code_verifier: verifier,
       scope: SCOPES
     });
-    const res = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
+    const res = await fetchWithTimeout(
+      tokenUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
+      },
+      20000
+    );
     const data = await res.json();
     if (!res.ok) {
       throw new Error(`OneDrive 换取令牌失败: ${data.error_description || data.error || res.status}`);
@@ -217,42 +314,92 @@ export class OneDriveProvider {
       redirectUri,
       accessToken: data.access_token,
       refreshToken: data.refresh_token || this.auth?.refreshToken || '',
-      expiresAt: Date.now() + (Number(data.expires_in || 3500) - 90) * 1000
+      expiresAt: Date.now() + (Number(data.expires_in || 3500) - 90) * 1000,
+      savedAt: Date.now()
     });
   }
 
+  // Single-flight token refresh with retry on transient cold-start network errors.
+  // Prevents concurrent startup API calls from double-spending Microsoft's single-use refresh token!
   async _refreshAccessToken() {
-    if (!this.auth?.refreshToken || !this.auth?.clientId) {
-      const err = new Error('OneDrive 会话已过期，请重新连接');
-      err.code = 'AUTH_EXPIRED';
-      throw err;
+    if (this._refreshPromise) {
+      return this._refreshPromise;
     }
-    const authority = this.auth.authority || 'consumers';
-    const tokenUrl = `https://login.microsoftonline.com/${authority}/oauth2/v2.0/token`;
-    const body = new URLSearchParams({
-      client_id: this.auth.clientId,
-      grant_type: 'refresh_token',
-      refresh_token: this.auth.refreshToken,
-      scope: SCOPES
-    });
-    const res = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      const err = new Error(`OneDrive 刷新令牌失败: ${data.error_description || data.error || res.status}`);
-      err.code = 'AUTH_EXPIRED';
-      throw err;
+
+    this._refreshPromise = (async () => {
+      // Re-read storage first in case another tab/window already rotated the token
+      const latest = this._loadAuth();
+      if (latest) this.auth = latest;
+      if (this.auth?.accessToken && Date.now() < (this.auth.expiresAt || 0)) {
+        return this.auth.accessToken;
+      }
+
+      if (!this.auth?.refreshToken || !this.auth?.clientId) {
+        const err = new Error('OneDrive 会话已过期，请重新连接');
+        err.code = 'AUTH_EXPIRED';
+        throw err;
+      }
+
+      const authority = this.auth.authority || 'consumers';
+      const tokenUrl = `https://login.microsoftonline.com/${authority}/oauth2/v2.0/token`;
+      const body = new URLSearchParams({
+        client_id: this.auth.clientId,
+        grant_type: 'refresh_token',
+        refresh_token: this.auth.refreshToken,
+        scope: SCOPES
+      });
+
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await fetchWithTimeout(
+            tokenUrl,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body
+            },
+            20000
+          );
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.access_token) {
+            this._saveAuth({
+              ...this.auth,
+              accessToken: data.access_token,
+              refreshToken: data.refresh_token || this.auth.refreshToken,
+              expiresAt: Date.now() + (Number(data.expires_in || 3500) - 90) * 1000,
+              savedAt: Date.now()
+            });
+            appLog.info('OneDrive', '访问令牌静默刷新成功');
+            return this.auth.accessToken;
+          }
+          // Transient Microsoft 5xx -> retry
+          if (res.status >= 500 && attempt < 2) {
+            await sleep(700 * (attempt + 1));
+            continue;
+          }
+          const err = new Error(`OneDrive 刷新令牌失败: ${data.error_description || data.error || res.status}`);
+          err.code = 'AUTH_EXPIRED';
+          throw err;
+        } catch (err) {
+          lastErr = err;
+          if (err?.code === 'AUTH_EXPIRED') throw err;
+          if (attempt < 2) {
+            appLog.warn('OneDrive', `刷新令牌网络波动，第 ${attempt + 1} 次重试: ${err?.message || err}`);
+            await sleep(800 * (attempt + 1));
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastErr || new Error('OneDrive 刷新令牌失败');
+    })();
+
+    try {
+      return await this._refreshPromise;
+    } finally {
+      this._refreshPromise = null;
     }
-    this._saveAuth({
-      ...this.auth,
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token || this.auth.refreshToken,
-      expiresAt: Date.now() + (Number(data.expires_in || 3500) - 90) * 1000
-    });
-    return this.auth.accessToken;
   }
 
   async _ensureToken() {
@@ -265,34 +412,67 @@ export class OneDriveProvider {
   async disconnect() {
     this._saveAuth(null);
     this.workspaceReady = false;
+    this._refreshPromise = null;
   }
 
   async _graphFetch(pathOrUrl, options = {}, allow404 = false) {
-    const token = await this._ensureToken();
     const url = pathOrUrl.startsWith('http') ? pathOrUrl : `${GRAPH_API}${pathOrUrl}`;
-    let res = await fetch(url, {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(options.headers || {})
-      }
-    });
-    if (res.status === 401 && this.auth?.refreshToken) {
-      const newToken = await this._refreshAccessToken();
-      res = await fetch(url, {
-        ...options,
-        headers: {
-          Authorization: `Bearer ${newToken}`,
-          ...(options.headers || {})
+    let lastErr = null;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const token = await this._ensureToken();
+        let res = await fetchWithTimeout(
+          url,
+          {
+            ...options,
+            headers: {
+              Authorization: `Bearer ${token}`,
+              ...(options.headers || {})
+            }
+          },
+          25000
+        );
+        if (res.status === 401 && this.auth?.refreshToken) {
+          // Force refresh once via single-flight lock
+          if (this.auth) this.auth.expiresAt = 0;
+          const newToken = await this._refreshAccessToken();
+          res = await fetchWithTimeout(
+            url,
+            {
+              ...options,
+              headers: {
+                Authorization: `Bearer ${newToken}`,
+                ...(options.headers || {})
+              }
+            },
+            25000
+          );
         }
-      });
+        if (allow404 && res.status === 404) return null;
+        if ((res.status === 429 || res.status >= 500) && attempt < 2) {
+          await sleep(700 * (attempt + 1));
+          continue;
+        }
+        if (!res.ok) {
+          const txt = await res.text().catch(() => '');
+          throw new Error(`OneDrive API 错误 (${res.status}): ${txt.slice(0, 220)}`);
+        }
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (err?.code === 'AUTH_EXPIRED' || String(err?.message || '').includes('OneDrive API 错误 (4')) {
+          throw err;
+        }
+        if (attempt < 2) {
+          appLog.warn('OneDrive', `Graph 请求波动，第 ${attempt + 1} 次重试: ${err?.message || err}`);
+          await sleep(800 * (attempt + 1));
+          continue;
+        }
+        throw err;
+      }
     }
-    if (allow404 && res.status === 404) return null;
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new Error(`OneDrive API 错误 (${res.status}): ${txt.slice(0, 220)}`);
-    }
-    return res;
+    throw lastErr || new Error('OneDrive 网络请求失败');
   }
 
   async _fetchProfileAndQuota() {

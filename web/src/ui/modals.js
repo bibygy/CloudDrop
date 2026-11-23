@@ -7,7 +7,8 @@ import { getAppRedirectUri } from '../providers/base.js';
 import { ICONS } from './icons.js';
 import { escapeHtml } from './markdown.js';
 import { showToast } from './toast.js';
-import { appLog } from './logger.js';
+import { appLog, exportDiagnosticLogs } from './logger.js';
+import { copyText } from './clipboard.js';
 
 let activeTab = 'cloud';
 let logFilter = 'all'; // 'all' | 'error' | 'backend'
@@ -243,8 +244,8 @@ function renderCloudTab(bodyEl) {
 
   bodyEl.querySelectorAll('[data-copy-text]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      await navigator.clipboard.writeText(btn.getAttribute('data-copy-text'));
-      showToast('已复制地址', 'success', 1500);
+      const ok = await copyText(btn.getAttribute('data-copy-text'));
+      showToast(ok ? '已复制地址' : '复制失败', ok ? 'success' : 'error', 1500);
     });
   });
 
@@ -284,23 +285,35 @@ function renderCloudTab(bodyEl) {
   // OneDrive connect/disconnect
   const odInput = document.getElementById('input-od-cid');
   const odTenant = document.getElementById('select-od-tenant');
+  const odBtn = document.getElementById('btn-connect-od');
+  const odRedirectBtn = document.getElementById('btn-connect-od-redirect');
   const connectOd = async (useRedirect) => {
     const cid = odInput ? odInput.value.trim() : s.onedriveClientId;
     const authority = odTenant ? odTenant.value : s.onedriveAuthority;
     store.updateSettings({ onedriveClientId: cid, onedriveAuthority: authority, provider: 'onedrive' });
+    if (odBtn) odBtn.disabled = true;
+    if (odRedirectBtn) odRedirectBtn.disabled = true;
     try {
-      const ok = await syncEngine.providers.onedrive.connect({ clientId: cid, authority, useRedirect });
+      const ok = await syncEngine.providers.onedrive.connect({
+        clientId: cid,
+        authority,
+        useRedirect,
+        reauth: onedriveConnected
+      });
       if (ok) {
         showToast('OneDrive 连接成功！正在同步...', 'success');
         await syncEngine.syncNow();
         renderSettingsModal();
       }
     } catch (err) {
-      showToast(err.message || '连接失败', 'error', 4200);
+      showToast(err.message || '连接失败', 'error', 6000);
+    } finally {
+      if (odBtn) odBtn.disabled = false;
+      if (odRedirectBtn) odRedirectBtn.disabled = false;
     }
   };
-  document.getElementById('btn-connect-od')?.addEventListener('click', () => connectOd(false));
-  document.getElementById('btn-connect-od-redirect')?.addEventListener('click', () => connectOd(true));
+  odBtn?.addEventListener('click', () => connectOd(false));
+  odRedirectBtn?.addEventListener('click', () => connectOd(true));
   document.getElementById('btn-disconnect-od')?.addEventListener('click', async () => {
     await syncEngine.providers.onedrive.disconnect();
     syncEngine._refreshSyncBanner();
@@ -472,14 +485,6 @@ function renderDeviceTab(bodyEl) {
       </div>
       <button class="btn btn-danger btn-sm" id="btn-clear-cache" type="button">清空缓存</button>
     </div>
-
-    <div class="setup-guide">
-      <strong>Windows / Android / Linux 三端部署说明</strong>
-      <ol>
-        <li><strong>Windows / Linux</strong>：直接运行项目内 <code>start-windows.bat</code>（或 <code>start-windows-panel.bat</code> 窄侧栏模式）/ <code>start-linux.sh</code>，或通过仓库 GitHub Actions 构建 Tauri 原生安装包。</li>
-        <li><strong>Android</strong>：将 <code>web/</code> 免费部署到 GitHub Pages 后用 Chrome「添加到主屏幕」即可成为独立 App 并接入 Android 系统分享菜单；也可使用 <code>platforms/android</code> 或 <code>platforms/tauri</code> 编译原生 APK。</li>
-      </ol>
-    </div>
   `;
 
   document.getElementById('btn-save-device')?.addEventListener('click', () => {
@@ -618,22 +623,13 @@ async function renderLogsTab(bodyEl) {
   document.getElementById('btn-log-copy')?.addEventListener('click', async () => {
     if (hasDesktop) await fetchBackendLogs();
     const text = appLog.formatPlainText(cachedBackendLines);
-    await navigator.clipboard.writeText(text);
-    showToast('已复制全部脱敏诊断日志', 'success', 1800);
+    const ok = await copyText(text);
+    showToast(ok ? '已复制全部脱敏诊断日志' : '复制失败', ok ? 'success' : 'error', 1800);
   });
 
   document.getElementById('btn-log-export')?.addEventListener('click', async () => {
-    if (hasDesktop) await fetchBackendLogs();
-    const text = appLog.formatPlainText(cachedBackendLines);
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `clouddrop-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.log`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    await exportDiagnosticLogs();
+    showToast('诊断日志已导出', 'success', 1800);
   });
 
   document.getElementById('btn-log-clear')?.addEventListener('click', async () => {

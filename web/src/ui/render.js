@@ -1,5 +1,5 @@
 // Reactive DOM Renderer for CloudDrop
-// Clean, flicker-free rendering for sidebar, drop stream, image lazy hydration, and lightbox
+// Zero-flicker keyed incremental reconciliation + targeted in-place upload/download progress updates
 
 import { store } from '../state/store.js';
 import { syncEngine } from '../sync/engine.js';
@@ -7,6 +7,7 @@ import { ICONS, platformIcon } from './icons.js';
 import { escapeHtml, renderMarkdown } from './markdown.js';
 import { formatBytes } from '../providers/base.js';
 import { showToast } from './toast.js';
+import { copyText } from './clipboard.js';
 
 const FILTER_LABELS = {
   all: '全部投递',
@@ -16,6 +17,13 @@ const FILTER_LABELS = {
   file: '文件传输',
   link: '网页链接'
 };
+
+function setHtmlIfChanged(el, html) {
+  if (!el) return;
+  if (el.__lastHtml === html) return;
+  el.__lastHtml = html;
+  el.innerHTML = html;
+}
 
 function formatTime(ts) {
   const d = new Date(ts);
@@ -91,7 +99,7 @@ export function initLightboxEvents() {
   }
 }
 
-// ---- Sidebar & Topbar Render ----
+// ---- Sidebar & Topbar Render (Diff-Guarded to Prevent Flicker) ----
 export function renderChrome() {
   const counts = store.getCounts();
   const devices = store.getDevices();
@@ -120,7 +128,9 @@ export function renderChrome() {
         ? `已同步 ${formatTime(s.lastSyncedAt)}`
         : '配置云盘';
 
-    cloudCard.innerHTML = `
+    setHtmlIfChanged(
+      cloudCard,
+      `
       <div class="cloud-card-top">
         <div class="cloud-provider-badge">
           <span class="status-dot ${escapeHtml(s.status)}"></span>
@@ -134,7 +144,8 @@ export function renderChrome() {
         )}</span>
       </div>
       ${quotaHtml}
-    `;
+    `
+    );
   }
 
   // Filter nav items
@@ -148,15 +159,18 @@ export function renderChrome() {
       { id: 'file', icon: ICONS.file, label: '文件传输', count: counts.file },
       { id: 'link', icon: ICONS.link, label: '网页链接', count: counts.link }
     ];
-    navEl.innerHTML = defs
-      .map(
-        (d) => `
+    setHtmlIfChanged(
+      navEl,
+      defs
+        .map(
+          (d) => `
       <button class="nav-item ${store.filter === d.id && !store.deviceFilter ? 'active' : ''}" data-filter="${d.id}" type="button">
         <span class="nav-item-left">${d.icon}<span>${d.label}</span></span>
         <span class="nav-count">${d.count}</span>
       </button>`
-      )
-      .join('');
+        )
+        .join('')
+    );
   }
 
   // Compact / Mobile horizontal tabs
@@ -170,20 +184,25 @@ export function renderChrome() {
       { id: 'file', label: `文件 (${counts.file})` },
       { id: 'link', label: `链接 (${counts.link})` }
     ];
-    compactTabs.innerHTML = defs
-      .map(
-        (d) =>
-          `<button class="compact-tab ${store.filter === d.id && !store.deviceFilter ? 'active' : ''}" data-filter="${d.id}" type="button">${d.label}</button>`
-      )
-      .join('');
+    setHtmlIfChanged(
+      compactTabs,
+      defs
+        .map(
+          (d) =>
+            `<button class="compact-tab ${store.filter === d.id && !store.deviceFilter ? 'active' : ''}" data-filter="${d.id}" type="button">${d.label}</button>`
+        )
+        .join('')
+    );
   }
 
   // Devices list
   const devEl = document.getElementById('device-nav');
   if (devEl) {
-    devEl.innerHTML = devices
-      .map(
-        (dev) => `
+    setHtmlIfChanged(
+      devEl,
+      devices
+        .map(
+          (dev) => `
       <button class="nav-item ${store.deviceFilter === dev.deviceId ? 'active' : ''}" data-device="${escapeHtml(dev.deviceId)}" type="button">
         <span class="nav-item-left">
           ${platformIcon(dev.platform)}
@@ -191,8 +210,9 @@ export function renderChrome() {
         </span>
         <span class="nav-count">${dev.count}</span>
       </button>`
-      )
-      .join('');
+        )
+        .join('')
+    );
   }
 
   // Topbar view title & E2EE badge & sync button
@@ -208,18 +228,20 @@ export function renderChrome() {
     if (store.tagFilter) {
       title = `#${store.tagFilter}`;
     }
-    titleEl.textContent = title;
+    if (titleEl.textContent !== title) titleEl.textContent = title;
   }
   if (subEl) {
-    subEl.textContent = `${filtered.length} 条`;
+    const subText = `${filtered.length} 条`;
+    if (subEl.textContent !== subText) subEl.textContent = subText;
   }
 
   const e2eeBadge = document.getElementById('e2ee-badge');
   if (e2eeBadge) {
     e2eeBadge.style.display = store.settings.e2eeEnabled ? 'inline-flex' : 'none';
-    e2eeBadge.innerHTML = `${store.e2eeUnlocked ? ICONS.lock : ICONS.unlock}<span>${
-      store.e2eeUnlocked ? 'E2EE 已开启' : '需解锁'
-    }</span>`;
+    setHtmlIfChanged(
+      e2eeBadge,
+      `${store.e2eeUnlocked ? ICONS.lock : ICONS.unlock}<span>${store.e2eeUnlocked ? 'E2EE 已开启' : '需解锁'}</span>`
+    );
   }
 
   const syncBtn = document.getElementById('btn-sync');
@@ -235,13 +257,64 @@ export function renderChrome() {
   const themeBtn = document.getElementById('btn-theme');
   if (themeBtn) {
     const theme = store.settings.theme || 'system';
-    themeBtn.innerHTML = theme === 'dark' ? ICONS.moon : theme === 'light' ? ICONS.sun : ICONS.monitor;
+    setHtmlIfChanged(themeBtn, theme === 'dark' ? ICONS.moon : theme === 'light' ? ICONS.sun : ICONS.monitor);
     themeBtn.title = `切换主题（当前：${theme === 'dark' ? '深色' : theme === 'light' ? '浅色' : '跟随系统'}）`;
   }
 }
 
-// ---- Stream Cards Render ----
+// ---- Targeted In-Place Upload / Download Progress Patcher (ZERO Stream Re-render!) ----
+export function updateTransferProgressDom() {
+  const container = document.getElementById('stream-container');
+  if (!container) return;
+
+  const nodes = container.querySelectorAll('[data-progress-file]');
+  for (const node of nodes) {
+    const fileId = node.getAttribute('data-progress-file');
+    const prog = store.transferProgress.get(fileId);
+    const track = node.querySelector('[data-progress-track]');
+    const fill = node.querySelector('[data-progress-fill]');
+    const label = node.querySelector('[data-progress-label]');
+
+    if (prog) {
+      if (track) track.style.display = '';
+      if (fill) fill.style.width = `${prog.pct}%`;
+      if (label) {
+        label.style.display = '';
+        label.textContent = `${prog.phase === 'upload' ? '正在上传' : '正在下载'} ${prog.pct}%`;
+      }
+    } else {
+      if (track) track.style.display = 'none';
+      if (fill) fill.style.width = '0%';
+      if (label) {
+        label.textContent = '';
+        label.style.display = 'none';
+      }
+    }
+  }
+}
+
+// ---- Keyed Incremental Stream Renderer (Zero Flicker on Refresh & Upload) ----
 let lastRenderedCount = 0;
+let initialHydrated = false;
+const seenCardIds = new Set();
+
+function contentSignature(item) {
+  const isEditing = store.editingItemId === item.id;
+  const attSig = (item.attachments || []).map((a) => `${a.fileId}:${a.name}:${a.size}`).join(',');
+  return `${item.updatedAt}|${item.pinned ? 1 : 0}|${isEditing ? 1 : 0}|${item.deviceName}|${item.text || ''}|${attSig}`;
+}
+
+function syncChipHtml(pending) {
+  return pending
+    ? `<span class="sync-state-chip pending" title="等待上传到云盘">${ICONS.clock}<span>待同步</span></span>`
+    : `<span class="sync-state-chip synced" title="已保存">${ICONS.check}</span>`;
+}
+
+function htmlToElement(html) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html.trim();
+  return tpl.content.firstElementChild;
+}
 
 export function renderStream({ scrollToBottom = false } = {}) {
   const container = document.getElementById('stream-container');
@@ -253,53 +326,112 @@ export function renderStream({ scrollToBottom = false } = {}) {
 
   if (items.length === 0) {
     const isFiltering = Boolean(store.searchQuery || store.filter !== 'all' || store.deviceFilter || store.tagFilter);
-    container.innerHTML = isFiltering
-      ? `
-      <div class="empty-state">
-        <div class="empty-icon">${ICONS.search}</div>
-        <h2 class="empty-title">没有匹配的投递内容</h2>
-        <p class="empty-desc">尝试清空搜索关键词或切换左侧分类筛选。</p>
-        <button class="btn btn-secondary" id="btn-reset-filters" type="button">显示全部内容</button>
-      </div>`
-      : `
-      <div class="empty-state">
-        <div class="empty-icon">${ICONS.droplet}</div>
-        <h2 class="empty-title">欢迎使用 CloudDrop</h2>
-        <p class="empty-desc">你的三端清爽云端投递箱 — 像给自己发消息一样，在 Windows、Android 与 Linux 之间瞬间流转笔记、截图和任意文件。</p>
-        <div class="empty-hints">
-          <div class="hint-chip"><strong>拖放或 Ctrl+V</strong><span>直接粘贴截图、图片和任意文件</span></div>
-          <div class="hint-chip"><strong>Google Drive / OneDrive</strong><span>数据直存个人云盘，无第三方服务器</span></div>
-          <div class="hint-chip"><strong>Markdown 与代码</strong><span>支持代码块高亮与一键复制</span></div>
-          <div class="hint-chip"><strong>Ctrl+K 秒速检索</strong><span>跨设备按文字、文件名或 #标签 搜索</span></div>
-        </div>
-      </div>`;
-    const resetBtn = document.getElementById('btn-reset-filters');
-    if (resetBtn) {
-      resetBtn.addEventListener('click', () => {
-        store.setFilter('all');
-        store.setSearchQuery('');
-        const si = document.getElementById('search-input');
-        if (si) si.value = '';
-      });
+    const emptyKey = isFiltering ? 'empty-filter' : 'empty-welcome';
+    if (container.dataset.emptyKey !== emptyKey) {
+      container.dataset.emptyKey = emptyKey;
+      container.innerHTML = isFiltering
+        ? `
+        <div class="empty-state">
+          <div class="empty-icon">${ICONS.search}</div>
+          <h2 class="empty-title">没有匹配的投递内容</h2>
+          <p class="empty-desc">尝试清空搜索关键词或切换左侧分类筛选。</p>
+          <button class="btn btn-secondary" id="btn-reset-filters" type="button">显示全部内容</button>
+        </div>`
+        : `
+        <div class="empty-state">
+          <div class="empty-icon">${ICONS.droplet}</div>
+          <h2 class="empty-title">欢迎使用 CloudDrop</h2>
+          <p class="empty-desc">你的三端清爽云端投递箱 — 像给自己发消息一样，在 Windows、Android 与 Linux 之间瞬间流转笔记、截图和任意文件。</p>
+          <div class="empty-hints">
+            <div class="hint-chip"><strong>拖放或 Ctrl+V</strong><span>直接粘贴截图、图片和任意文件</span></div>
+            <div class="hint-chip"><strong>Google Drive / OneDrive</strong><span>数据直存个人云盘，无第三方服务器</span></div>
+            <div class="hint-chip"><strong>Markdown 与代码</strong><span>支持代码块高亮与一键复制</span></div>
+            <div class="hint-chip"><strong>Ctrl+K 秒速检索</strong><span>跨设备按文字、文件名或 #标签 搜索</span></div>
+          </div>
+        </div>`;
+      const resetBtn = document.getElementById('btn-reset-filters');
+      if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+          store.setFilter('all');
+          store.setSearchQuery('');
+          const si = document.getElementById('search-input');
+          if (si) si.value = '';
+        });
+      }
     }
     lastRenderedCount = 0;
     return;
   }
 
-  const chunks = [];
+  // Transitioning out of empty state
+  if (container.dataset.emptyKey) {
+    delete container.dataset.emptyKey;
+    container.innerHTML = '';
+  }
+
+  // Index existing DOM nodes by data-key for zero-flicker reuse
+  const existingByKey = new Map();
+  for (const child of Array.from(container.children)) {
+    const k = child.getAttribute('data-key');
+    if (k) existingByKey.set(k, child);
+  }
+
+  const desiredNodes = [];
   let prevDate = '';
 
   for (const item of items) {
     const dateLabel = formatDateLabel(item.createdAt);
     if (dateLabel !== prevDate) {
-      chunks.push(`<div class="date-divider"><span>${escapeHtml(dateLabel)}</span></div>`);
+      const dateKey = `date:${dateLabel}`;
+      let divEl = existingByKey.get(dateKey);
+      if (!divEl) {
+        divEl = htmlToElement(`<div class="date-divider" data-key="${escapeHtml(dateKey)}"><span>${escapeHtml(dateLabel)}</span></div>`);
+      }
+      desiredNodes.push(divEl);
       prevDate = dateLabel;
     }
-    chunks.push(renderCardHtml(item));
+
+    const cardKey = `card:${item.id}`;
+    const sig = contentSignature(item);
+    let cardEl = existingByKey.get(cardKey);
+
+    if (cardEl && cardEl.getAttribute('data-sig') === sig) {
+      // Unchanged card content: patch only sync status chip in-place if pending state changed (0 flicker!)
+      const pendingStr = item.pending ? '1' : '0';
+      if (cardEl.getAttribute('data-pending') !== pendingStr) {
+        cardEl.setAttribute('data-pending', pendingStr);
+        const slot = cardEl.querySelector('[data-sync-slot]');
+        if (slot) slot.innerHTML = syncChipHtml(item.pending);
+      }
+      desiredNodes.push(cardEl);
+    } else {
+      const isTrulyNew = initialHydrated && !seenCardIds.has(item.id) && !cardEl;
+      const fresh = htmlToElement(renderCardHtml(item, sig, isTrulyNew));
+      desiredNodes.push(fresh);
+    }
+    seenCardIds.add(item.id);
   }
 
-  container.innerHTML = chunks.join('');
+  // Reconcile container children in-place without destroying unchanged nodes
+  const desiredSet = new Set(desiredNodes);
+  for (const child of Array.from(container.children)) {
+    if (!desiredSet.has(child)) {
+      child.remove();
+    }
+  }
+
+  for (let i = 0; i < desiredNodes.length; i++) {
+    const target = desiredNodes[i];
+    const currentAtI = container.children[i];
+    if (currentAtI !== target) {
+      container.insertBefore(target, currentAtI || null);
+    }
+  }
+
   hydrateVisibleImages(container, items);
+  updateTransferProgressDom();
+
+  if (items.length > 0) initialHydrated = true;
 
   if (scrollToBottom || (items.length > lastRenderedCount && wasNearBottom)) {
     requestAnimationFrame(() => {
@@ -309,15 +441,13 @@ export function renderStream({ scrollToBottom = false } = {}) {
   lastRenderedCount = items.length;
 }
 
-function renderCardHtml(item) {
+function renderCardHtml(item, sig, animateEnter = false) {
   const isEditing = store.editingItemId === item.id;
   const atts = item.attachments || [];
   const images = atts.filter((a) => (a.mimeType || '').startsWith('image/'));
   const files = atts.filter((a) => !(a.mimeType || '').startsWith('image/'));
 
-  const syncChip = item.pending
-    ? `<span class="sync-state-chip pending" title="等待上传到云盘">${ICONS.clock}<span>待同步</span></span>`
-    : `<span class="sync-state-chip synced" title="已保存">${ICONS.check}</span>`;
+  const syncChip = `<span data-sync-slot>${syncChipHtml(item.pending)}</span>`;
 
   const pinBadge = item.pinned ? `<span class="pin-indicator">${ICONS.pin}<span>置顶</span></span>` : '';
   const encBadge = item.encrypted ? `<span class="sync-state-chip synced" title="端到端加密">${ICONS.lock}</span>` : '';
@@ -361,16 +491,16 @@ function renderCardHtml(item) {
     images.length > 0
       ? `<div class="image-grid ${images.length === 1 ? 'single' : ''}">${images
           .map((img) => {
-            const prog = store.transferProgress.get(img.fileId);
             const cachedUrl = syncEngine.blobUrlCache.get(img.fileId);
             return `
-            <div class="image-tile" data-image-id="${escapeHtml(img.fileId)}" data-image-name="${escapeHtml(img.name)}" data-item-id="${escapeHtml(item.id)}">
+            <div class="image-tile" data-image-id="${escapeHtml(img.fileId)}" data-image-name="${escapeHtml(img.name)}" data-item-id="${escapeHtml(item.id)}" data-progress-file="${escapeHtml(img.fileId)}">
               ${
                 cachedUrl
                   ? `<img src="${cachedUrl}" alt="${escapeHtml(img.name)}" loading="lazy" />`
                   : `<div class="image-placeholder">
-                      <span>${prog ? `${prog.phase === 'upload' ? '上传中' : '加载中'} ${prog.pct}%` : escapeHtml(img.name)}</span>
-                      ${prog ? `<div class="progress-track" style="width:120px"><div class="progress-fill" style="width:${prog.pct}%"></div></div>` : ''}
+                      <span>${escapeHtml(img.name)}</span>
+                      <span data-progress-label style="display:none"></span>
+                      <div class="progress-track" data-progress-track style="width:120px;display:none"><div class="progress-fill" data-progress-fill style="width:0%"></div></div>
                     </div>`
               }
             </div>`;
@@ -383,18 +513,17 @@ function renderCardHtml(item) {
       ? `<div class="file-list">${files
           .map((f) => {
             const { ext, cls } = getExtInfo(f.name, f.mimeType);
-            const prog = store.transferProgress.get(f.fileId);
             return `
-            <div class="file-card">
+            <div class="file-card" data-progress-file="${escapeHtml(f.fileId)}">
               <div class="file-card-left">
                 <div class="file-ext-badge ${cls}">${escapeHtml(ext)}</div>
                 <div class="file-info">
                   <div class="file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</div>
                   <div class="file-sub">
                     <span>${formatBytes(f.size)}</span>
-                    ${prog ? `<span>${prog.phase === 'upload' ? '正在上传' : '正在下载'} ${prog.pct}%</span>` : ''}
+                    <span data-progress-label style="display:none"></span>
                   </div>
-                  ${prog ? `<div class="progress-track"><div class="progress-fill" style="width:${prog.pct}%"></div></div>` : ''}
+                  <div class="progress-track" data-progress-track style="display:none"><div class="progress-fill" data-progress-fill style="width:0%"></div></div>
                 </div>
               </div>
               <button class="file-dl-btn" type="button" data-action="download-file" data-item-id="${escapeHtml(item.id)}" data-file-id="${escapeHtml(f.fileId)}">
@@ -413,7 +542,7 @@ function renderCardHtml(item) {
       : '';
 
   return `
-    <article class="drop-card ${item.pinned ? 'pinned' : ''}" data-id="${escapeHtml(item.id)}">
+    <article class="drop-card ${item.pinned ? 'pinned' : ''} ${animateEnter ? 'card-enter' : ''}" data-key="card:${escapeHtml(item.id)}" data-id="${escapeHtml(item.id)}" data-sig="${escapeHtml(sig)}" data-pending="${item.pending ? '1' : '0'}">
       <div class="drop-card-header">
         <div class="drop-meta">
           <span class="device-badge">${platformIcon(item.platform)}<span>${escapeHtml(item.deviceName)}</span></span>
@@ -462,7 +591,7 @@ function hydrateVisibleImages(container, items) {
     syncEngine
       .getPreviewUrl(att)
       .then((url) => {
-        if (!url || !tile.isConnected) return;
+        if (!url || !tile.isConnected || tile.querySelector('img')) return;
         tile.innerHTML = `<img src="${url}" alt="${escapeHtml(att.name)}" loading="lazy" />`;
       })
       .catch(() => {
@@ -481,13 +610,13 @@ export function bindStreamEvents() {
     const codeCopyBtn = e.target.closest('[data-copy-code]');
     if (codeCopyBtn) {
       const code = decodeURIComponent(codeCopyBtn.getAttribute('data-copy-code') || '');
-      try {
-        await navigator.clipboard.writeText(code);
+      const ok = await copyText(code);
+      if (ok) {
         codeCopyBtn.innerHTML = `${ICONS.check}<span>已复制</span>`;
         setTimeout(() => {
           codeCopyBtn.innerHTML = `${ICONS.copy}<span>复制</span>`;
         }, 1500);
-      } catch {
+      } else {
         showToast('复制失败，请检查剪贴板权限', 'error');
       }
       return;
@@ -518,10 +647,10 @@ export function bindStreamEvents() {
     const item = store.items.find((x) => x.id === id);
 
     if (action === 'copy' && item) {
-      try {
-        await navigator.clipboard.writeText(item.text || '');
+      const ok = await copyText(item.text || '');
+      if (ok) {
         showToast('已复制到剪贴板', 'success', 1800);
-      } catch {
+      } else {
         showToast('复制失败', 'error');
       }
     } else if (action === 'pin' && item) {

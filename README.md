@@ -83,6 +83,10 @@ Android 端提供 **原生 APK** 与 **Web PWA** 两种使用方式，建议根�
 3. 推送到 `main` / `master` 分支时会自动触发；也可点击右侧 **Run workflow** 手动运行。
 4. 等待约 **2~3 分钟**出现绿色对勾 `✓` 后，点进该次运行记录，滑到页面最底部的 **Artifacts** 区域下载 **`CloudDrop-Android-APK`**。
 5. 解压得到 `app-debug.apk`，在 Android 手机或平板上安装即可。下载的附件默认保存在手机 `下载/CloudDrop/` 目录。
+6. **（可选，强烈推荐）配置固定签名以支持后续直接覆盖升级 APK**：
+   - GitHub Actions 每次构建环境都是全新虚拟机，默认临时调试签名每次都会变化，导致新旧 APK 覆盖安装时系统提示签名/包名冲突。
+   - 无需安装 Android Studio，在 Windows 本地运行一次 `powershell -ExecutionPolicy Bypass -File desktop\generate-android-keystore.ps1`（利用已安装的 JDK `keytool` 自动生成持久化密钥并复制 Base64）。
+   - 打开 GitHub 仓库 → **Settings → Secrets and variables → Actions → New repository secret**，新建名为 **`ANDROID_KEYSTORE_BASE64`** 的 Secret 并粘贴即可。此后所有新构建的 APK 都会使用同一固定签名且版本号自动递增，手机端可直接覆盖升级，无需卸载重登！
 
 #### 方式 B：通过 GitHub Pages 部署 PWA 独立应用（推荐 Google Drive 用户）
 

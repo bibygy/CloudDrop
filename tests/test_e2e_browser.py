@@ -147,7 +147,7 @@ def run_e2e(screenshot_dir: Path | None = None) -> None:
             if ready:
                 break
             time.sleep(0.15)
-        assert ready, "App failed to initialize"
+        assert ready, f"App failed to initialize! exceptions={cdp.exceptions} console_errors={cdp.console_errors}"
 
         # 1. Seed a multi-device Android & Linux event directly on disk to verify conflict-free pull sync!
         now_ms = int(time.time() * 1000)
@@ -334,7 +334,60 @@ def run_e2e(screenshot_dir: Path | None = None) -> None:
         time.sleep(0.15)
         assert cdp.eval("document.querySelectorAll('.drop-card').length") == 3
 
-        # 4. Verify WebCrypto E2EE round-trip directly in browser!
+        # 4. Verify UX fixes: no DROP pill, zero-flicker DOM identity preservation on refresh/progress,
+        #    short non-overflowing composer placeholder, error toast "下载日志" button, and AndroidBridge copyText!
+        ux_ok = cdp.eval(
+            """
+            (async () => {
+              const noDropPill = !document.querySelector('.brand-pill');
+              const ta = document.getElementById('composer-input');
+              const placeholderShort = ta && ta.placeholder.length <= 22;
+
+              // Check DOM node identity is preserved across repeated stream re-renders (zero flicker!)
+              const firstCardBefore = document.querySelector('.drop-card');
+              const firstImgBefore = document.querySelector('.image-tile img');
+              const { renderStream, updateTransferProgressDom } = await import('/src/ui/render.js');
+              const { store } = await import('/src/state/store.js');
+              store.setTransferProgress('file_seed_pdf_1', { pct: 45, phase: 'upload' });
+              updateTransferProgressDom();
+              renderStream();
+              const firstCardAfter = document.querySelector('.drop-card');
+              const firstImgAfter = document.querySelector('.image-tile img');
+              const sameCardNode = firstCardBefore && firstCardBefore === firstCardAfter;
+              const sameImgNode = firstImgBefore && firstImgBefore === firstImgAfter;
+              store.setTransferProgress('file_seed_pdf_1', null);
+
+              // Check error toast includes "下载日志" button
+              const { showToast } = await import('/src/ui/toast.js');
+              showToast('模拟连接异常', 'error', 5000);
+              const hasDlLogBtn = Array.from(document.querySelectorAll('.toast-action-btn')).some(b => b.textContent.includes('下载日志'));
+
+              // Check Settings -> 设备与备份 has no "三端部署说明"
+              const { openSettingsModal, closeSettingsModal } = await import('/src/ui/modals.js');
+              openSettingsModal('device');
+              const deviceTabText = document.getElementById('settings-body')?.innerText || '';
+              const noDeployGuide = !deviceTabText.includes('三端部署说明');
+              closeSettingsModal();
+
+              // Check universal copyText uses AndroidBridge.copyText when present
+              const { copyText } = await import('/src/ui/clipboard.js');
+              let copiedVal = '';
+              window.AndroidBridge = { copyText: (t) => { copiedVal = t; return true; } };
+              const copyOk = await copyText('hello-android-copy');
+              delete window.AndroidBridge;
+
+              return { noDropPill, placeholderShort, sameCardNode, sameImgNode, hasDlLogBtn, noDeployGuide, copyOk, copiedVal };
+            })()
+            """
+        )
+        assert ux_ok["noDropPill"] is True, f"DROP pill still present: {ux_ok}"
+        assert ux_ok["placeholderShort"] is True, f"Placeholder still too long: {ux_ok}"
+        assert ux_ok["sameCardNode"] is True and ux_ok["sameImgNode"] is True, f"DOM rebuilt/flickered on refresh: {ux_ok}"
+        assert ux_ok["hasDlLogBtn"] is True, f"Error toast missing 下载日志 button: {ux_ok}"
+        assert ux_ok["noDeployGuide"] is True, f"Deploy guide still present in device tab: {ux_ok}"
+        assert ux_ok["copyOk"] is True and ux_ok["copiedVal"] == "hello-android-copy", f"AndroidBridge copy failed: {ux_ok}"
+
+        # 5. Verify WebCrypto E2EE round-trip directly in browser!
         e2ee_ok = cdp.eval(
             """
             (async () => {

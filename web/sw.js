@@ -23,6 +23,7 @@ const SHELL_ASSETS = [
   './src/providers/gdrive.js',
   './src/providers/onedrive.js',
   './src/sync/engine.js',
+  './src/ui/clipboard.js',
   './src/ui/icons.js',
   './src/ui/logger.js',
   './src/ui/markdown.js',

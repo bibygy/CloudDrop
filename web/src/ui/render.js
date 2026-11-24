@@ -59,14 +59,16 @@ function getExtInfo(filename, mimeType = '') {
 // ---- Lightbox ----
 let activeLightboxBlobUrl = null;
 let activeLightboxName = '';
+let activeLightboxAtt = null;
 
-export function openLightbox(blobUrl, name) {
+export function openLightbox(blobUrl, name, att = null) {
   const lb = document.getElementById('lightbox');
   const img = document.getElementById('lightbox-img');
   const title = document.getElementById('lightbox-title');
   if (!lb || !img) return;
   activeLightboxBlobUrl = blobUrl;
   activeLightboxName = name || 'image.png';
+  activeLightboxAtt = att;
   img.src = blobUrl;
   img.alt = activeLightboxName;
   if (title) title.textContent = activeLightboxName;
@@ -89,7 +91,17 @@ export function initLightboxEvents() {
     });
   }
   if (dlBtn) {
-    dlBtn.addEventListener('click', () => {
+    dlBtn.addEventListener('click', async () => {
+      if (activeLightboxAtt) {
+        try {
+          await syncEngine.downloadAttachmentToDevice(activeLightboxAtt);
+          showToast(`已保存 ${activeLightboxName}`, 'success', 2000);
+          return;
+        } catch (err) {
+          showToast(err.message || '下载原图失败', 'error');
+          return;
+        }
+      }
       if (!activeLightboxBlobUrl) return;
       const a = document.createElement('a');
       a.href = activeLightboxBlobUrl;
@@ -633,9 +645,12 @@ export function bindStreamEvents() {
     const tile = e.target.closest('.image-tile[data-image-id]');
     if (tile) {
       const fileId = tile.getAttribute('data-image-id');
+      const itemId = tile.getAttribute('data-item-id');
       const name = tile.getAttribute('data-image-name');
       const url = syncEngine.blobUrlCache.get(fileId);
-      if (url) openLightbox(url, name);
+      const targetItem = store.items.find((x) => x.id === itemId);
+      const att = targetItem?.attachments?.find((a) => a.fileId === fileId) || null;
+      if (url) openLightbox(url, name, att);
       return;
     }
 
@@ -683,8 +698,8 @@ export function bindStreamEvents() {
       const att = targetItem?.attachments?.find((a) => a.fileId === fileId);
       if (!att) return;
       try {
-        await syncEngine.downloadAttachmentToDevice(att);
-        showToast(`开始下载 ${att.name}`, 'success', 2000);
+        const savedPath = await syncEngine.downloadAttachmentToDevice(att);
+        showToast(savedPath && savedPath.includes('/') ? `已保存到 ${savedPath}` : `开始下载 ${att.name}`, 'success', 2600);
       } catch (err) {
         showToast(err.message || '下载失败', 'error');
       }

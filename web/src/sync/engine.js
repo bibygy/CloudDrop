@@ -609,17 +609,58 @@ export class SyncEngine {
     return url;
   }
 
+  async _saveBlobViaAndroidBridge(blob, fileName, mimeType) {
+    const bridge = window.AndroidBridge;
+    if (!bridge) return null;
+
+    // Prefer chunked streaming bridge (512 KB chunks) so even 50 MB+ files never hit WebView JNI OOM
+    if (typeof bridge.beginSaveFile === 'function' && typeof bridge.appendSaveChunk === 'function') {
+      const start = JSON.parse(bridge.beginSaveFile(fileName, mimeType || ''));
+      if (!start?.ok || !start.token) {
+        throw new Error(start?.error || '无法在手机下载目录创建文件');
+      }
+      const token = start.token;
+      try {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const CHUNK = 512 * 1024;
+        for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+          const slice = bytes.subarray(offset, Math.min(offset + CHUNK, bytes.length));
+          const ok = bridge.appendSaveChunk(token, bytesToBase64(slice));
+          if (!ok) throw new Error('写入文件分片失败');
+        }
+        const done = JSON.parse(bridge.finishSaveFile(token));
+        if (!done?.ok) throw new Error(done?.error || '完成文件保存失败');
+        appLog.info('Download', `已保存到手机: ${done.path}`);
+        return done.path;
+      } catch (err) {
+        try { bridge.cancelSaveFile?.(token); } catch {}
+        throw err;
+      }
+    }
+
+    // Backwards-compatible single-shot bridge for older APKs
+    if (typeof bridge.saveFile === 'function') {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const ok = bridge.saveFile(fileName, mimeType || '', bytesToBase64(bytes));
+      if (!ok) throw new Error('保存到手机下载目录失败');
+      return `Download/CloudDrop/${fileName}`;
+    }
+    return null;
+  }
+
   async downloadAttachmentToDevice(att) {
     const blob = await this.getBlobForAttachment(att, { autoDownload: true });
     if (!blob) {
       throw new Error('文件尚未同步到本地，请先连接云盘');
     }
-    // Inside Android native APK WebView, save directly to Downloads/CloudDrop via AndroidBridge
-    if (window.AndroidBridge && typeof window.AndroidBridge.saveFile === 'function') {
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      const ok = window.AndroidBridge.saveFile(att.name || 'download', att.mimeType || blob.type || '', bytesToBase64(bytes));
-      if (!ok) throw new Error('保存到手机下载目录失败');
-      return;
+    // Inside Android native APK WebView, stream directly to Download/CloudDrop/ via AndroidBridge
+    if (window.AndroidBridge) {
+      const savedPath = await this._saveBlobViaAndroidBridge(
+        blob,
+        att.name || 'download',
+        att.mimeType || blob.type || ''
+      );
+      return savedPath;
     }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -629,6 +670,7 @@ export class SyncEngine {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
+    return att.name || 'download';
   }
 
   // ---- Backup Export / Import ----
@@ -641,11 +683,18 @@ export class SyncEngine {
       exportedAt: new Date().toISOString(),
       events
     };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const jsonStr = JSON.stringify(payload, null, 2);
+    const fileName = `clouddrop-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    if (window.AndroidBridge && typeof window.AndroidBridge.saveFile === 'function') {
+      const bytes = new TextEncoder().encode(jsonStr);
+      const ok = window.AndroidBridge.saveFile(fileName, 'application/json', bytesToBase64(bytes));
+      if (ok) return;
+    }
+    const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `clouddrop-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = fileName;
     document.body.appendChild(a);
     a.click();
     a.remove();

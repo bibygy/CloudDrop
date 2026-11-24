@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,6 +15,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -30,8 +32,11 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : AppCompatActivity() {
 
@@ -73,6 +78,107 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private data class PendingSaveSession(
+        val fileName: String,
+        val displayPath: String,
+        val outputStream: OutputStream,
+        val mediaUri: Uri? = null,
+        val directFile: File? = null
+    )
+
+    private val saveSessions = ConcurrentHashMap<String, PendingSaveSession>()
+
+    private fun resolveSafeMime(fileName: String, rawMime: String): String {
+        val trimmed = rawMime.trim()
+        if (trimmed.isNotEmpty() && trimmed != "application/octet-stream") return trimmed
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        if (ext.isNotEmpty()) {
+            MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.let { return it }
+        }
+        return "application/octet-stream"
+    }
+
+    private fun openDownloadSession(fileName: String, mimeType: String): PendingSaveSession {
+        val safeName = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "clouddrop_${System.currentTimeMillis()}" }
+        val safeMime = resolveSafeMime(safeName, mimeType)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            // Try Download/CloudDrop/ first (trailing slash is required by Android 10 / HarmonyOS!),
+            // then fall back to Download/ root if strict OEM MediaStore rejects subfolder.
+            val candidateDirs = listOf(
+                Environment.DIRECTORY_DOWNLOADS + "/CloudDrop/",
+                Environment.DIRECTORY_DOWNLOADS + "/"
+            )
+            for (relDir in candidateDirs) {
+                try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, safeName)
+                        put(MediaStore.MediaColumns.MIME_TYPE, safeMime)
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, relDir)
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val uri = contentResolver.insert(collection, values)
+                    if (uri != null) {
+                        val os = contentResolver.openOutputStream(uri, "w")
+                        if (os != null) {
+                            return PendingSaveSession(
+                                fileName = safeName,
+                                displayPath = "${relDir}$safeName",
+                                outputStream = os,
+                                mediaUri = uri
+                            )
+                        }
+                        contentResolver.delete(uri, null, null)
+                    }
+                } catch (_: Exception) {
+                    // try next fallback location
+                }
+            }
+            // Last-resort app-specific external Downloads folder (always writable, visible in Android/data/com.clouddrop.app/files/Download)
+            val fallbackDir = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir, "CloudDrop")
+            fallbackDir.mkdirs()
+            val outFile = File(fallbackDir, safeName)
+            return PendingSaveSession(
+                fileName = safeName,
+                displayPath = outFile.absolutePath,
+                outputStream = FileOutputStream(outFile),
+                directFile = outFile
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            val dir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "CloudDrop"
+            )
+            dir.mkdirs()
+            val outFile = File(dir, safeName)
+            return PendingSaveSession(
+                fileName = safeName,
+                displayPath = "Download/CloudDrop/$safeName",
+                outputStream = FileOutputStream(outFile),
+                directFile = outFile
+            )
+        }
+    }
+
+    private fun finalizeDownloadSession(session: PendingSaveSession) {
+        session.outputStream.flush()
+        session.outputStream.close()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && session.mediaUri != null) {
+            val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+            contentResolver.update(session.mediaUri, done, null, null)
+            // Notify Huawei/HarmonyOS & Android media scanner so file managers show the file immediately
+            val absPath = File(
+                Environment.getExternalStorageDirectory(),
+                session.displayPath
+            ).absolutePath
+            MediaScannerConnection.scanFile(this, arrayOf(absPath), null, null)
+        } else if (session.directFile != null) {
+            MediaScannerConnection.scanFile(this, arrayOf(session.directFile.absolutePath), null, null)
+        }
+    }
+
     private inner class AndroidBridge {
         @JavascriptInterface
         fun copyText(text: String): Boolean {
@@ -87,34 +193,90 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Chunked streaming saver for files of any size (avoids WebView JNI OOM on large files!)
+        @JavascriptInterface
+        fun beginSaveFile(fileName: String, mimeType: String): String {
+            return try {
+                val session = openDownloadSession(fileName, mimeType)
+                val token = UUID.randomUUID().toString()
+                saveSessions[token] = session
+                JSONObject().apply {
+                    put("ok", true)
+                    put("token", token)
+                    put("path", session.displayPath)
+                }.toString()
+            } catch (e: Exception) {
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "无法创建本地文件")
+                }.toString()
+            }
+        }
+
+        @JavascriptInterface
+        fun appendSaveChunk(token: String, base64Chunk: String): Boolean {
+            val session = saveSessions[token] ?: return false
+            return try {
+                val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+                session.outputStream.write(bytes)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun finishSaveFile(token: String): String {
+            val session = saveSessions.remove(token)
+                ?: return JSONObject().apply {
+                    put("ok", false)
+                    put("error", "保存会话不存在")
+                }.toString()
+            return try {
+                finalizeDownloadSession(session)
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "已保存到 ${session.displayPath}", Toast.LENGTH_LONG).show()
+                }
+                JSONObject().apply {
+                    put("ok", true)
+                    put("path", session.displayPath)
+                }.toString()
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "保存失败: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "完成写入失败")
+                }.toString()
+            }
+        }
+
+        @JavascriptInterface
+        fun cancelSaveFile(token: String) {
+            val session = saveSessions.remove(token) ?: return
+            try {
+                session.outputStream.close()
+            } catch (_: Exception) {}
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && session.mediaUri != null) {
+                try {
+                    contentResolver.delete(session.mediaUri, null, null)
+                } catch (_: Exception) {}
+            } else {
+                session.directFile?.delete()
+            }
+        }
+
+        // Legacy single-shot saver kept for small files & backwards compatibility
         @JavascriptInterface
         fun saveFile(fileName: String, mimeType: String, base64Data: String): Boolean {
             return try {
                 val bytes = Base64.decode(base64Data, Base64.DEFAULT)
-                val safeName = fileName.ifBlank { "clouddrop_${System.currentTimeMillis()}" }
-                val safeMime = mimeType.ifBlank { "application/octet-stream" }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, safeName)
-                        put(MediaStore.Downloads.MIME_TYPE, safeMime)
-                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/CloudDrop")
-                    }
-                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                        ?: return false
-                    contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                } else {
-                    @Suppress("DEPRECATION")
-                    val dir = File(
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                        "CloudDrop"
-                    )
-                    dir.mkdirs()
-                    FileOutputStream(File(dir, safeName)).use { it.write(bytes) }
-                }
-
+                val session = openDownloadSession(fileName, mimeType)
+                session.outputStream.write(bytes)
+                finalizeDownloadSession(session)
                 runOnUiThread {
-                    Toast.makeText(this@MainActivity, "已保存到 下载/CloudDrop/$safeName", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "已保存到 ${session.displayPath}", Toast.LENGTH_LONG).show()
                 }
                 true
             } catch (e: Exception) {

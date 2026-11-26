@@ -2,7 +2,7 @@
 // Auth: Zero-dependency RFC 7636 OAuth 2.0 Authorization Code + PKCE (S256) with Refresh Token rotation!
 // Works cleanly with Personal Microsoft Accounts (/consumers) AND Work/School (/common)
 
-import { getAppRedirectUri, xhrDownloadBlob, xhrUpload } from './base.js';
+import { bytesToBase64, formatBytes, getAppRedirectUri, xhrDownloadBlob, xhrUpload } from './base.js';
 import { appLog } from '../ui/logger.js';
 
 const TOKEN_STORAGE_KEY = 'clouddrop_onedrive_auth_v1';
@@ -11,7 +11,63 @@ const AUTH_CHANNEL_NAME = 'clouddrop_onedrive_auth_channel';
 const GRAPH_API = 'https://graph.microsoft.com/v1.0';
 const SCOPES = 'Files.ReadWrite User.Read offline_access';
 const SIMPLE_LIMIT = 4 * 1024 * 1024; // 4 MB
-const CHUNK_SIZE = 327680 * 10; // 3.2 MiB (exact multiple of 320 KiB as required by Microsoft Graph)
+const GRAPH_CHUNK_UNIT = 327680; // 320 KiB (Microsoft Graph required alignment)
+const DESKTOP_CHUNK_SIZE = GRAPH_CHUNK_UNIT * 20; // 6.25 MiB (6,553,600 B)
+const ANDROID_BRIDGE_CHUNK_SIZE = GRAPH_CHUNK_UNIT * 5; // 1.56 MiB (1,638,400 B, safe for WebView JNI)
+const MAX_CHUNK_RETRIES = 5;
+const CHUNK_INACTIVITY_TIMEOUT_MS = 120000;
+
+const nativeHttpPending = new Map();
+let nativeHttpSeq = 0;
+
+function ensureNativeHttpBridge() {
+  if (typeof window === 'undefined') return;
+  if (!window.__clouddropNativeCb) {
+    window.__clouddropNativeCb = (reqId, rawJson) => {
+      const entry = nativeHttpPending.get(reqId);
+      if (!entry) return;
+      nativeHttpPending.delete(reqId);
+      clearTimeout(entry.timer);
+      try {
+        const parsed = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
+        entry.resolve(parsed);
+      } catch (err) {
+        entry.reject(err);
+      }
+    };
+  }
+}
+
+function callNativeAsync(invoker, timeoutMs = 135000) {
+  ensureNativeHttpBridge();
+  const reqId = `nat_${++nativeHttpSeq}_${Date.now().toString(36)}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativeHttpPending.delete(reqId);
+      const err = new Error(`原生通道请求超时 (${Math.round(timeoutMs / 1000)}s)`);
+      err.isTimeout = true;
+      err.isNetworkError = true;
+      reject(err);
+    }, timeoutMs);
+    nativeHttpPending.set(reqId, { resolve, reject, timer });
+    try {
+      invoker(reqId);
+    } catch (err) {
+      nativeHttpPending.delete(reqId);
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
+function parseNextExpectedOffset(data) {
+  const ranges = data?.nextExpectedRanges;
+  if (!Array.isArray(ranges) || ranges.length === 0) return null;
+  const first = String(ranges[0] || '');
+  const startStr = first.split('-')[0];
+  const n = Number(startStr);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -529,7 +585,13 @@ export class OneDriveProvider {
 
   _preferLocalProxy() {
     const h = window.location.hostname;
-    return h === 'appassets.androidplatform.net' || h === 'localhost' || h === '127.0.0.1' || Boolean(this._hasLocalProxy);
+    return (
+      h === 'appassets.androidplatform.net' ||
+      h === 'localhost' ||
+      h === '127.0.0.1' ||
+      /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+      Boolean(this._hasLocalProxy)
+    );
   }
 
   async _fetchDownloadUrl(downloadUrl) {
@@ -680,89 +742,368 @@ export class OneDriveProvider {
     return { remoteId: data.id };
   }
 
+  async _putUploadChunk({ uploadUrl, chunk, offset, totalSize, transport, onProgress }) {
+    const end = offset + chunk.size;
+    const contentRange = `bytes ${offset}-${end - 1}/${totalSize}`;
+    const basePct = Math.min(99, Math.max(1, Math.round((offset / totalSize) * 100)));
+
+    // Keep sync heartbeat alive while local-proxy or Android native bridge forwards a large chunk upstream
+    let heartbeat = null;
+    if (transport !== 'direct' && onProgress) {
+      heartbeat = setInterval(() => {
+        onProgress(basePct, '');
+      }, 10000);
+    }
+
+    try {
+      if (transport === 'android-bridge') {
+        const buf = await chunk.arrayBuffer();
+        const b64 = bytesToBase64(new Uint8Array(buf));
+        const res = await callNativeAsync(
+          (reqId) => window.AndroidBridge.putUploadChunkAsync(reqId, uploadUrl, contentRange, b64),
+          CHUNK_INACTIVITY_TIMEOUT_MS + 15000
+        );
+        if (!res || (!res.status && res.error)) {
+          const err = new Error(res?.error || 'Android 原生分片上传网络中断');
+          err.isNetworkError = true;
+          throw err;
+        }
+        let parsed = null;
+        if (res.body) {
+          try {
+            parsed = JSON.parse(res.body);
+          } catch {
+            parsed = null;
+          }
+        }
+        if (res.status === 200 || res.status === 201 || res.status === 202) {
+          return { status: res.status, data: parsed };
+        }
+        const err = new Error(`HTTP ${res.status}: ${String(res.body || res.error || '').slice(0, 220)}`);
+        err.status = res.status;
+        err.retryAfter = Number(res.retryAfter) > 0 ? Number(res.retryAfter) : null;
+        throw err;
+      }
+
+      const targetUrl =
+        transport === 'local-proxy'
+          ? `/api/onedrive-upload-proxy?url=${encodeURIComponent(uploadUrl)}`
+          : uploadUrl;
+
+      return await xhrUpload({
+        method: 'PUT',
+        url: targetUrl,
+        headers: { 'Content-Range': contentRange },
+        body: chunk,
+        acceptStatuses: [200, 201, 202],
+        inactivityTimeoutMs: CHUNK_INACTIVITY_TIMEOUT_MS,
+        onProgress: (_, loaded) => {
+          if (!onProgress) return;
+          // On local-proxy, XHR measures localhost upload speed; cap intra-chunk progress at 50%
+          // until OneDrive upstream actually acknowledges the chunk.
+          const effectiveLoaded = transport === 'local-proxy' ? loaded * 0.5 : loaded;
+          const pct = Math.min(99, Math.max(1, Math.round(((offset + effectiveLoaded) / totalSize) * 100)));
+          onProgress(pct, '');
+        }
+      });
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+    }
+  }
+
+  async _queryUploadSession(uploadUrl, transport) {
+    try {
+      if (
+        transport === 'android-bridge' &&
+        typeof window !== 'undefined' &&
+        typeof window.AndroidBridge?.queryUploadSessionAsync === 'function'
+      ) {
+        const res = await callNativeAsync(
+          (reqId) => window.AndroidBridge.queryUploadSessionAsync(reqId, uploadUrl),
+          30000
+        );
+        if (res?.status === 404) return { expired: true };
+        if (res?.status >= 200 && res?.status < 300 && res.body) {
+          const data = JSON.parse(res.body);
+          return { expired: false, nextOffset: parseNextExpectedOffset(data), data };
+        }
+        return null;
+      }
+
+      const proxyUrl = `/api/onedrive-proxy?url=${encodeURIComponent(uploadUrl)}`;
+      let res = null;
+      if (transport === 'local-proxy') {
+        res = await fetchWithTimeout(proxyUrl, { cache: 'no-store' }, 25000);
+      } else {
+        try {
+          res = await fetchWithTimeout(uploadUrl, { cache: 'no-store' }, 20000);
+        } catch {
+          if (this._preferLocalProxy()) {
+            res = await fetchWithTimeout(proxyUrl, { cache: 'no-store' }, 25000);
+          }
+        }
+      }
+      if (!res) return null;
+      if (res.status === 404) return { expired: true };
+      if (!res.ok) return null;
+      const data = await res.json();
+      return { expired: false, nextOffset: parseNextExpectedOffset(data), data };
+    } catch {
+      return null;
+    }
+  }
+
+  async _lookupUploadedItem(safeEnc, expectedSize) {
+    try {
+      const res = await this._graphFetch(`/me/drive/root:/CloudDrop/files/${safeEnc}`, {}, true);
+      if (!res) return null;
+      const item = await res.json();
+      if (item?.id && (!expectedSize || Number(item.size) === expectedSize)) {
+        return item;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async uploadFileBlob(filename, blob, mimeType, onProgress) {
     await this.ensureWorkspace();
-    const token = await this._ensureToken();
     const safeEnc = encodeURIComponent(filename);
 
     if (blob.size <= SIMPLE_LIMIT) {
-      const res = await xhrUpload({
-        method: 'PUT',
-        url: `${GRAPH_API}/me/drive/root:/CloudDrop/files/${safeEnc}:/content`,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': mimeType || 'application/octet-stream'
-        },
-        body: blob,
-        onProgress
-      });
-      return { remoteId: res.data?.id || filename, size: blob.size };
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const token = await this._ensureToken();
+          const res = await xhrUpload({
+            method: 'PUT',
+            url: `${GRAPH_API}/me/drive/root:/CloudDrop/files/${safeEnc}:/content`,
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': mimeType || 'application/octet-stream'
+            },
+            body: blob,
+            inactivityTimeoutMs: CHUNK_INACTIVITY_TIMEOUT_MS,
+            onProgress: (pct) => onProgress?.(pct, '')
+          });
+          return { remoteId: res.data?.id || filename, size: blob.size };
+        } catch (err) {
+          lastErr = err;
+          const retryable = err?.isNetworkError || err?.status === 429 || (err?.status >= 500 && err?.status < 600);
+          if (!retryable || attempt >= 3) throw err;
+          onProgress?.(5, `重试 ${attempt}/2`);
+          await sleep(1200 * attempt);
+        }
+      }
+      throw lastErr;
     }
 
-    // Microsoft Graph Resumable Upload Session for > 4 MB files
-    const sessRes = await this._graphFetch(
-      `/me/drive/root:/CloudDrop/files/${safeEnc}:/createUploadSession`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          item: { '@microsoft.graph.conflictBehavior': 'replace', name: filename }
-        })
-      }
-    );
-    const { uploadUrl } = await sessRes.json();
-    if (!uploadUrl) throw new Error('OneDrive 未返回 uploadUrl');
+    // Microsoft Graph Resumable Upload Session for > 4 MB files (with chunk retry, range resume & CORS fallback)
+    const hasAndroidBridge =
+      typeof window !== 'undefined' && typeof window.AndroidBridge?.putUploadChunkAsync === 'function';
+    const isAndroidWebView = typeof window !== 'undefined' && window.location.hostname === 'appassets.androidplatform.net';
+    let transport = 'direct';
+    let realignCount = 0;
 
-    let offset = 0;
-    let finalItem = null;
-    while (offset < blob.size) {
-      const end = Math.min(offset + CHUNK_SIZE, blob.size);
-      const chunk = blob.slice(offset, end);
-      const headers = {
-        'Content-Range': `bytes ${offset}-${end - 1}/${blob.size}`
-      };
-      let putRes;
-      try {
-        putRes = await fetch(uploadUrl, { method: 'PUT', headers, body: chunk });
-      } catch {
-        putRes = await fetch(`/api/onedrive-upload-proxy?url=${encodeURIComponent(uploadUrl)}`, {
-          method: 'PUT',
-          headers,
-          body: chunk
-        });
+    for (let sessionAttempt = 0; sessionAttempt < 2; sessionAttempt++) {
+      const sessRes = await this._graphFetch(
+        `/me/drive/root:/CloudDrop/files/${safeEnc}:/createUploadSession`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            item: { '@microsoft.graph.conflictBehavior': 'replace', name: filename }
+          })
+        }
+      );
+      const { uploadUrl } = await sessRes.json();
+      if (!uploadUrl) throw new Error('OneDrive 未返回 uploadUrl');
+
+      appLog.info(
+        'OneDrive',
+        `创建大文件分片上传会话: ${filename} (${formatBytes(blob.size)})${sessionAttempt > 0 ? ' [重建会话]' : ''}`
+      );
+
+      let offset = 0;
+      let finalItem = null;
+      let sessionExpired = false;
+      let lastMilestone = 0;
+
+      while (offset < blob.size) {
+        const chunkSize = transport === 'android-bridge' ? ANDROID_BRIDGE_CHUNK_SIZE : DESKTOP_CHUNK_SIZE;
+        const end = Math.min(offset + chunkSize, blob.size);
+        const chunk = blob.slice(offset, end);
+        let chunkRestart = false;
+
+        for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
+          try {
+            const putRes = await this._putUploadChunk({
+              uploadUrl,
+              chunk,
+              offset,
+              totalSize: blob.size,
+              transport,
+              onProgress
+            });
+
+            if (putRes.status === 200 || putRes.status === 201) {
+              finalItem = putRes.data;
+              offset = blob.size;
+              onProgress?.(100, '');
+              break;
+            }
+
+            // 202 Accepted — advance to server-confirmed offset
+            const serverNext = parseNextExpectedOffset(putRes.data);
+            offset = serverNext !== null && serverNext >= end ? serverNext : end;
+            const pct = Math.min(99, Math.round((offset / blob.size) * 100));
+            onProgress?.(pct, '');
+            const milestone = Math.floor(pct / 25) * 25;
+            if (milestone >= 25 && milestone > lastMilestone) {
+              lastMilestone = milestone;
+              appLog.info('OneDrive', `大文件上传进度 ${pct}% (${formatBytes(offset)} / ${formatBytes(blob.size)})`);
+            }
+            break;
+          } catch (err) {
+            // Transparently switch away from direct PUT if WebView / browser hits CORS block
+            if (err?.isNetworkError && !err?.isTimeout && transport === 'direct') {
+              if (hasAndroidBridge) {
+                transport = 'android-bridge';
+                appLog.info('OneDrive', '直连分片受限，已自动切换至 Android 原生通道续传');
+                chunkRestart = true;
+                break;
+              }
+              if (!isAndroidWebView && this._preferLocalProxy()) {
+                transport = 'local-proxy';
+                appLog.info('OneDrive', '直连分片受限，已自动切换至桌面本地代理续传');
+                attempt--;
+                continue;
+              }
+            }
+
+            if (err?.status === 404) {
+              const finished = await this._lookupUploadedItem(safeEnc, blob.size);
+              if (finished?.id) {
+                onProgress?.(100, '');
+                return { remoteId: finished.id, size: blob.size };
+              }
+              sessionExpired = true;
+              break;
+            }
+
+            const retryable =
+              err?.isNetworkError ||
+              err?.isTimeout ||
+              err?.status === 408 ||
+              err?.status === 409 ||
+              err?.status === 416 ||
+              err?.status === 429 ||
+              (err?.status >= 500 && err?.status < 600);
+
+            if (retryable && attempt < MAX_CHUNK_RETRIES) {
+              const pct = Math.min(99, Math.max(1, Math.round((offset / blob.size) * 100)));
+              const sessStatus = await this._queryUploadSession(uploadUrl, transport);
+              if (sessStatus?.expired) {
+                const finished = await this._lookupUploadedItem(safeEnc, blob.size);
+                if (finished?.id) {
+                  onProgress?.(100, '');
+                  return { remoteId: finished.id, size: blob.size };
+                }
+                sessionExpired = true;
+                break;
+              }
+              if (sessStatus && Number.isFinite(sessStatus.nextOffset)) {
+                if (sessStatus.nextOffset >= blob.size) {
+                  const finished = await this._lookupUploadedItem(safeEnc, blob.size);
+                  if (finished?.id) {
+                    onProgress?.(100, '');
+                    return { remoteId: finished.id, size: blob.size };
+                  }
+                }
+                if (sessStatus.nextOffset !== offset && realignCount < 10) {
+                  realignCount++;
+                  appLog.info(
+                    'OneDrive',
+                    `断点续传对齐偏移量: ${formatBytes(offset)} -> ${formatBytes(sessStatus.nextOffset)}`
+                  );
+                  offset = sessStatus.nextOffset;
+                  onProgress?.(Math.min(99, Math.round((offset / blob.size) * 100)), '');
+                  chunkRestart = true;
+                  break;
+                }
+              }
+
+              const waitMs = err?.retryAfter
+                ? Math.min(30000, Math.max(1000, err.retryAfter * 1000))
+                : Math.min(12000, 1500 * attempt);
+              onProgress?.(pct, `重试 ${attempt}/${MAX_CHUNK_RETRIES - 1}`);
+              appLog.warn(
+                'OneDrive',
+                `分片 ${formatBytes(offset)}-${formatBytes(end)} 上传受阻 (${err?.status ? `HTTP ${err.status}` : err?.message || '网络波动'})，${Math.round(waitMs / 1000)}s 后重试`
+              );
+              await sleep(waitMs);
+              continue;
+            }
+
+            const failPct = Math.round((offset / blob.size) * 100);
+            throw new Error(
+              `OneDrive 分片上传失败 (已传 ${failPct}%，${err?.status ? `HTTP ${err.status}` : err?.message || '网络异常'})`
+            );
+          }
+        }
+
+        if (sessionExpired) break;
+        if (chunkRestart) continue;
       }
-      if (!putRes.ok && putRes.status !== 202) {
-        throw new Error(`OneDrive 分片上传失败 (${putRes.status})`);
+
+      if (sessionExpired && sessionAttempt === 0) {
+        appLog.warn('OneDrive', '上传会话已失效，正在重建上传会话重新上传');
+        continue;
       }
-      if (putRes.status === 200 || putRes.status === 201) {
-        finalItem = await putRes.json();
+
+      if (!finalItem?.id) {
+        finalItem = await this._lookupUploadedItem(safeEnc, blob.size);
       }
-      offset = end;
-      if (onProgress) onProgress(Math.round((offset / blob.size) * 100));
+      return { remoteId: finalItem?.id || filename, size: blob.size };
     }
-    return { remoteId: finalItem?.id || filename, size: blob.size };
+
+    throw new Error('OneDrive 上传会话多次失效，请检查网络后重试');
   }
 
   async downloadFileBlob(remoteId, onProgress) {
-    const metaRes = await this._graphFetch(`/me/drive/items/${encodeURIComponent(remoteId)}`);
-    const meta = await metaRes.json();
-    const dlUrl = meta['@microsoft.graph.downloadUrl'];
-    if (!dlUrl) {
-      throw new Error('OneDrive 未返回文件下载链接');
-    }
-    const proxyUrl = `/api/onedrive-proxy?url=${encodeURIComponent(dlUrl)}`;
-    if (this._preferLocalProxy()) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        return await xhrDownloadBlob({ url: proxyUrl, onProgress });
-      } catch {
-        // fallback to direct
+        const metaRes = await this._graphFetch(`/me/drive/items/${encodeURIComponent(remoteId)}`);
+        const meta = await metaRes.json();
+        const dlUrl = meta['@microsoft.graph.downloadUrl'];
+        if (!dlUrl) {
+          throw new Error('OneDrive 未返回文件下载链接');
+        }
+        const proxyUrl = `/api/onedrive-proxy?url=${encodeURIComponent(dlUrl)}`;
+        if (this._preferLocalProxy()) {
+          try {
+            return await xhrDownloadBlob({ url: proxyUrl, onProgress, inactivityTimeoutMs: 120000 });
+          } catch {
+            // fallback to direct
+          }
+        }
+        try {
+          return await xhrDownloadBlob({ url: dlUrl, onProgress, inactivityTimeoutMs: 120000 });
+        } catch {
+          return await xhrDownloadBlob({ url: proxyUrl, onProgress, inactivityTimeoutMs: 120000 });
+        }
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) {
+          appLog.warn('OneDrive', `文件下载中断，正在重新获取链接重试: ${err?.message || err}`);
+          onProgress?.(2, '重试中');
+          await sleep(1200);
+        }
       }
     }
-    try {
-      return await xhrDownloadBlob({ url: dlUrl, onProgress });
-    } catch {
-      return await xhrDownloadBlob({ url: proxyUrl, onProgress });
-    }
+    throw lastErr;
   }
 
   async deleteFileBlob(remoteId) {

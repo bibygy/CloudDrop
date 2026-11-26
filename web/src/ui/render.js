@@ -292,7 +292,8 @@ export function updateTransferProgressDom() {
       if (fill) fill.style.width = `${prog.pct}%`;
       if (label) {
         label.style.display = '';
-        label.textContent = `${prog.phase === 'upload' ? '正在上传' : '正在下载'} ${prog.pct}%`;
+        const note = prog.note ? ` · ${prog.note}` : '';
+        label.textContent = `${prog.phase === 'upload' ? '正在上传' : '正在下载'} ${prog.pct}%${note}`;
       }
     } else {
       if (track) track.style.display = 'none';

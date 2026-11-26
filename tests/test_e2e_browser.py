@@ -410,6 +410,115 @@ def run_e2e(screenshot_dir: Path | None = None) -> None:
         )
         assert e2ee_ok is True, "WebCrypto E2EE round-trip failed!"
 
+        # 6. Regression test: large-file uploads (>45s) MUST NOT be interrupted/reset by auto-poll,
+        #    and OneDrive chunked upload MUST retry & resume via nextExpectedRanges without resetting to 0!
+        large_upload_ok = cdp.eval(
+            """
+            (async () => {
+              const { syncEngine } = await import('/src/sync/engine.js');
+              const { OneDriveProvider } = await import('/src/providers/onedrive.js');
+              const { store } = await import('/src/state/store.js');
+
+              // Part A: Slow upload passing 90s elapsed with active progress heartbeats MUST skip concurrent syncNow()
+              const origLocal = syncEngine.providers.local;
+              let uploadInvocations = 0;
+              let concurrentSkipResult = null;
+              let progressDuringPoll = null;
+              const mockSlowProvider = {
+                id: 'local',
+                name: 'MockSlowLargeDrive',
+                isConnected: () => true,
+                getAccountInfo: () => ({ providerName: 'MockSlowLargeDrive', accountLabel: 'test' }),
+                ensureWorkspace: async () => true,
+                listEvents: async () => ({ events: [], nextToken: null }),
+                uploadEventJson: async (name) => ({ remoteId: name }),
+                getQuota: async () => null,
+                uploadFileBlob: async (filename, blob, mimeType, onProgress) => {
+                  uploadInvocations++;
+                  onProgress(10);
+                  // Simulate >45s (actually 90s!) elapsed since sync started, while progress heartbeat just fired
+                  syncEngine.syncStartedAt = Date.now() - 90000;
+                  concurrentSkipResult = await syncEngine.syncNow({ silent: true });
+                  progressDuringPoll = Array.from(store.transferProgress.values())[0]?.pct || 0;
+                  onProgress(55);
+                  syncEngine.syncStartedAt = Date.now() - 200000;
+                  const secondPoll = await syncEngine.syncNow({ silent: true });
+                  if (!secondPoll?.skipped) throw new Error('Second concurrent sync was not skipped!');
+                  onProgress(100);
+                  return { remoteId: 'remote_big_ok', size: blob.size };
+                }
+              };
+
+              syncEngine.providers.local = mockSlowProvider;
+              let partAOk = false;
+              try {
+                // Wait for any in-flight sync to settle
+                for (let i = 0; i < 20 && syncEngine.syncing; i++) {
+                  await new Promise((r) => setTimeout(r, 50));
+                }
+                const fakeBigFile = new File([new Uint8Array(1024 * 64)], 'vacation-120mb-sim.mp4', { type: 'video/mp4' });
+                await syncEngine.createDrop({ text: '测试大视频上传不断连', files: [fakeBigFile] });
+                for (let i = 0; i < 40 && syncEngine.syncing; i++) {
+                  await new Promise((r) => setTimeout(r, 50));
+                }
+                partAOk =
+                  uploadInvocations === 1 &&
+                  concurrentSkipResult?.skipped === true &&
+                  progressDuringPoll === 10;
+              } finally {
+                syncEngine.providers.local = origLocal;
+              }
+
+              // Part B: OneDriveProvider 15 MiB multi-chunk upload with transient 503 on chunk #2
+              // verifies retry + nextExpectedRanges recovery WITHOUT resetting offset to 0!
+              const od = new OneDriveProvider();
+              od.workspaceReady = true;
+              od._ensureToken = async () => 'fake_token';
+              od._graphFetch = async () => ({
+                json: async () => ({ uploadUrl: 'https://my.microsoftpersonalcontent.com/upload/mock-session' })
+              });
+              const sentOffsets = [];
+              let failedChunk2Once = false;
+              od._putUploadChunk = async ({ offset, chunk, totalSize }) => {
+                sentOffsets.push(offset);
+                if (offset > 0 && !failedChunk2Once) {
+                  failedChunk2Once = true;
+                  const err = new Error('HTTP 503: Service Unavailable');
+                  err.status = 503;
+                  err.retryAfter = 0.05;
+                  throw err;
+                }
+                const end = offset + chunk.size;
+                if (end >= totalSize) {
+                  return { status: 201, data: { id: 'od_video_final_999' } };
+                }
+                return { status: 202, data: { nextExpectedRanges: [`${end}-`] } };
+              };
+              od._queryUploadSession = async () => ({ expired: false, nextOffset: 6553600 });
+
+              const progressTrace = [];
+              const bigBlob = new Blob([new Uint8Array(15 * 1024 * 1024)], { type: 'video/mp4' });
+              const odRes = await od.uploadFileBlob('big-video.mp4', bigBlob, 'video/mp4', (pct) => {
+                progressTrace.push(pct);
+              });
+              // Expected offsets: 0, 6553600 (503!), 6553600 (retry ok), 13107200 (201 ok) — NEVER resets back to 0!
+              const partBOk =
+                odRes.remoteId === 'od_video_final_999' &&
+                sentOffsets.length === 4 &&
+                sentOffsets[0] === 0 &&
+                sentOffsets[1] === 6553600 &&
+                sentOffsets[2] === 6553600 &&
+                sentOffsets[3] === 13107200 &&
+                progressTrace[progressTrace.length - 1] === 100 &&
+                !progressTrace.includes(0);
+
+              return { partAOk, partBOk, uploadInvocations, concurrentSkipResult, progressDuringPoll, sentOffsets, odRes };
+            })()
+            """
+        )
+        assert large_upload_ok["partAOk"] is True, f"Large upload heartbeat lock regression failed: {large_upload_ok}"
+        assert large_upload_ok["partBOk"] is True, f"OneDrive chunk retry/resume regression failed: {large_upload_ok}"
+
         assert not cdp.exceptions, f"Uncaught JS exceptions: {cdp.exceptions}"
         assert not cdp.console_errors, f"Console errors: {cdp.console_errors}"
         print("E2E BROWSER VERIFICATION PASSED (0 JS errors, multi-device sync OK, E2EE OK)!")

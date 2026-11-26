@@ -32,11 +32,14 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
@@ -87,6 +90,33 @@ class MainActivity : AppCompatActivity() {
     )
 
     private val saveSessions = ConcurrentHashMap<String, PendingSaveSession>()
+    private val nativeHttpExecutor = Executors.newFixedThreadPool(2)
+
+    private class DisconnectingInputStream(
+        source: InputStream,
+        private val conn: HttpURLConnection
+    ) : FilterInputStream(source) {
+        override fun close() {
+            try {
+                super.close()
+            } finally {
+                try {
+                    conn.disconnect()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun dispatchNativeCallback(requestId: String, payload: JSONObject) {
+        val reqLit = JSONObject.quote(requestId)
+        val dataLit = JSONObject.quote(payload.toString())
+        val js = "window.__clouddropNativeCb && window.__clouddropNativeCb($reqLit, $dataLit);"
+        runOnUiThread {
+            if (::webView.isInitialized && !isDestroyed) {
+                webView.evaluateJavascript(js, null)
+            }
+        }
+    }
 
     private fun resolveSafeMime(fileName: String, rawMime: String): String {
         val trimmed = rawMime.trim()
@@ -286,6 +316,111 @@ class MainActivity : AppCompatActivity() {
                 false
             }
         }
+
+        // Async CORS-free chunked upload proxy for OneDrive >4 MB files on Android WebView
+        @JavascriptInterface
+        fun putUploadChunkAsync(
+            requestId: String,
+            uploadUrl: String,
+            contentRange: String,
+            base64Chunk: String
+        ) {
+            nativeHttpExecutor.execute {
+                val res = JSONObject()
+                if (!isAllowedOneDriveUrl(uploadUrl)) {
+                    res.put("ok", false)
+                    res.put("status", 403)
+                    res.put("error", "Disallowed upload host")
+                    dispatchNativeCallback(requestId, res)
+                    return@execute
+                }
+                var conn: HttpURLConnection? = null
+                try {
+                    val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+                    val connection = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "PUT"
+                        doOutput = true
+                        connectTimeout = 20000
+                        readTimeout = 120000
+                        setFixedLengthStreamingMode(bytes.size)
+                        setRequestProperty("User-Agent", "CloudDrop-Android/1.0")
+                        setRequestProperty("Content-Type", "application/octet-stream")
+                        if (contentRange.isNotBlank()) {
+                            setRequestProperty("Content-Range", contentRange)
+                        }
+                    }
+                    conn = connection
+                    connection.outputStream.use { os ->
+                        os.write(bytes)
+                        os.flush()
+                    }
+                    val code = connection.responseCode
+                    val stream = if (code in 200..299) {
+                        connection.inputStream
+                    } else {
+                        connection.errorStream ?: ByteArrayInputStream(ByteArray(0))
+                    }
+                    val bodyStr = stream.use { it.bufferedReader(Charsets.UTF_8).readText() }
+                    res.put("ok", code in 200..299)
+                    res.put("status", code)
+                    res.put("body", bodyStr)
+                    connection.getHeaderField("Retry-After")?.let { res.put("retryAfter", it) }
+                } catch (e: Exception) {
+                    res.put("ok", false)
+                    res.put("status", 0)
+                    res.put("error", e.message ?: "分片上传网络异常")
+                } finally {
+                    try {
+                        conn?.disconnect()
+                    } catch (_: Exception) {}
+                }
+                dispatchNativeCallback(requestId, res)
+            }
+        }
+
+        // Async CORS-free OneDrive upload session status probe (for nextExpectedRanges resume)
+        @JavascriptInterface
+        fun queryUploadSessionAsync(requestId: String, uploadUrl: String) {
+            nativeHttpExecutor.execute {
+                val res = JSONObject()
+                if (!isAllowedOneDriveUrl(uploadUrl)) {
+                    res.put("ok", false)
+                    res.put("status", 403)
+                    res.put("error", "Disallowed host")
+                    dispatchNativeCallback(requestId, res)
+                    return@execute
+                }
+                var conn: HttpURLConnection? = null
+                try {
+                    val connection = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 20000
+                        readTimeout = 30000
+                        setRequestProperty("User-Agent", "CloudDrop-Android/1.0")
+                    }
+                    conn = connection
+                    val code = connection.responseCode
+                    val stream = if (code in 200..299) {
+                        connection.inputStream
+                    } else {
+                        connection.errorStream ?: ByteArrayInputStream(ByteArray(0))
+                    }
+                    val bodyStr = stream.use { it.bufferedReader(Charsets.UTF_8).readText() }
+                    res.put("ok", code in 200..299)
+                    res.put("status", code)
+                    res.put("body", bodyStr)
+                } catch (e: Exception) {
+                    res.put("ok", false)
+                    res.put("status", 0)
+                    res.put("error", e.message ?: "查询上传状态失败")
+                } finally {
+                    try {
+                        conn?.disconnect()
+                    } catch (_: Exception) {}
+                }
+                dispatchNativeCallback(requestId, res)
+            }
+        }
     }
 
     private val allowedOneDriveSuffixes = listOf(
@@ -293,6 +428,8 @@ class MainActivity : AppCompatActivity() {
         ".microsoftpersonalcontent.com",
         ".sharepoint.com",
         ".livefilestore.com",
+        ".storage.live.com",
+        ".onedrive.live.com",
         ".onedrive.com",
         ".svc.ms"
     )
@@ -323,30 +460,42 @@ class MainActivity : AppCompatActivity() {
                 ByteArrayInputStream("Disallowed proxy host".toByteArray())
             )
         }
+        var conn: HttpURLConnection? = null
         return try {
-            val conn = (URL(targetUrl).openConnection() as HttpURLConnection).apply {
+            val connection = (URL(targetUrl).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 instanceFollowRedirects = true
                 connectTimeout = 20000
-                readTimeout = 30000
+                readTimeout = 120000
                 setRequestProperty("User-Agent", "CloudDrop-Android/1.0")
             }
-            val code = conn.responseCode
-            val rawType = conn.contentType ?: "application/octet-stream"
+            conn = connection
+            val code = connection.responseCode
+            val rawType = connection.contentType ?: "application/octet-stream"
             val mimeType = rawType.substringBefore(";").trim().ifEmpty { "application/octet-stream" }
-            val reason = conn.responseMessage?.ifBlank { null } ?: if (code in 200..299) "OK" else "Error"
-            val stream = if (code in 200..299) conn.inputStream else (conn.errorStream ?: ByteArrayInputStream(ByteArray(0)))
-            val bytes = stream.use { it.readBytes() }
-            conn.disconnect()
+            val reason = connection.responseMessage?.ifBlank { null } ?: if (code in 200..299) "OK" else "Error"
+            val respHeaders = HashMap<String, String>(corsHeaders)
+            val contentLen = connection.contentLengthLong
+            if (contentLen >= 0L) {
+                respHeaders["Content-Length"] = contentLen.toString()
+            }
+            val rawStream: InputStream = if (code in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream ?: ByteArrayInputStream(ByteArray(0))
+            }
             WebResourceResponse(
                 mimeType,
                 if (mimeType.startsWith("text/") || mimeType == "application/json") "UTF-8" else null,
                 code,
                 reason,
-                corsHeaders,
-                ByteArrayInputStream(bytes)
+                respHeaders,
+                DisconnectingInputStream(rawStream, connection)
             )
         } catch (e: Exception) {
+            try {
+                conn?.disconnect()
+            } catch (_: Exception) {}
             val msg = "Proxy error: ${e.message ?: "network failure"}"
             WebResourceResponse(
                 "text/plain",
@@ -497,6 +646,17 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShareIntent(intent)
+    }
+
+    override fun onDestroy() {
+        nativeHttpExecutor.shutdownNow()
+        for ((_, session) in saveSessions) {
+            try {
+                session.outputStream.close()
+            } catch (_: Exception) {}
+        }
+        saveSessions.clear()
+        super.onDestroy()
     }
 
     private fun handleShareIntent(intent: Intent?) {

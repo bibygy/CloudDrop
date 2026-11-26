@@ -96,6 +96,8 @@ ALLOWED_ONEDRIVE_SUFFIXES = (
     ".microsoftpersonalcontent.com",
     ".sharepoint.com",
     ".livefilestore.com",
+    ".storage.live.com",
+    ".onedrive.live.com",
     ".onedrive.com",
     ".svc.ms",
 )
@@ -276,20 +278,29 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             self._send_status(403, "Disallowed proxy host")
             return
         t0 = time.monotonic()
+        total_bytes = 0
         try:
             req = urllib.request.Request(target, headers={"User-Agent": "CloudDrop/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+                clen = resp.headers.get("Content-Length")
                 self.send_response(resp.status)
                 self._send_common_headers()
                 self.send_header("Content-Type", ctype)
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(data)))
+                if clen and clen.isdigit():
+                    self.send_header("Content-Length", clen)
                 self.end_headers()
-                self.wfile.write(data)
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    total_bytes += len(chunk)
             ms = int((time.monotonic() - t0) * 1000)
-            logger.info("OneDrive 代理 GET %s -> %d (%d B, %dms)", safe_url_label(target), resp.status, len(data), ms)
+            logger.info("OneDrive 代理 GET %s -> %d (%d B, %dms)", safe_url_label(target), resp.status, total_bytes, ms)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info("OneDrive 代理 GET 客户端已取消 (%s, 已传 %d B)", safe_url_label(target), total_bytes)
         except urllib.error.HTTPError as exc:
             err_body = exc.read()
             logger.warning("OneDrive 代理 GET %s -> HTTP %d", safe_url_label(target), exc.code)
@@ -312,7 +323,10 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(length) if length > 0 else b""
-        fwd_headers = {"User-Agent": "CloudDrop/1.0"}
+        fwd_headers = {
+            "User-Agent": "CloudDrop/1.0",
+            "Content-Length": str(len(body)),
+        }
         for hdr in ("Content-Type", "Content-Range"):
             val = self.headers.get(hdr)
             if val:
@@ -320,7 +334,7 @@ class CloudDropHandler(BaseHTTPRequestHandler):
         t0 = time.monotonic()
         try:
             req = urllib.request.Request(target, data=body, method="PUT", headers=fwd_headers)
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 data = resp.read()
                 self.send_response(resp.status)
                 self._send_common_headers()
@@ -332,10 +346,13 @@ class CloudDropHandler(BaseHTTPRequestHandler):
             logger.info("OneDrive 上传代理 PUT %s -> %d (%d B, %dms)", safe_url_label(target), resp.status, len(body), ms)
         except urllib.error.HTTPError as exc:
             err_body = exc.read()
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
             logger.warning("OneDrive 上传代理 PUT %s -> HTTP %d", safe_url_label(target), exc.code)
             self.send_response(exc.code)
             self._send_common_headers()
             self.send_header("Content-Type", "application/json")
+            if retry_after:
+                self.send_header("Retry-After", retry_after)
             self.send_header("Content-Length", str(len(err_body)))
             self.end_headers()
             self.wfile.write(err_body)

@@ -2,14 +2,28 @@
 // Auth: Google Identity Services (GIS) Token Client + OAuth 2.0 redirect fallback
 // Scope: https://www.googleapis.com/auth/drive.file (least-privilege: only CloudDrop's own folder/files!)
 
-import { getAppRedirectUri, xhrDownloadBlob, xhrUpload } from './base.js';
+import { formatBytes, getAppRedirectUri, xhrDownloadBlob, xhrUpload } from './base.js';
+import { appLog } from '../ui/logger.js';
 
 const TOKEN_STORAGE_KEY = 'clouddrop_gdrive_auth_v1';
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
 const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
 const RESUMABLE_THRESHOLD = 5 * 1024 * 1024; // 5 MB
-const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB (multiple of 256 KiB)
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MiB (exact multiple of 256 KiB as required by Google Drive)
+const MAX_CHUNK_RETRIES = 5;
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function parseGoogleRangeNextOffset(rangeHeader) {
+  if (!rangeHeader) return null;
+  const m = String(rangeHeader).match(/bytes=\d+-(\d+)/i);
+  if (!m) return null;
+  const lastByte = Number(m[1]);
+  return Number.isFinite(lastByte) && lastByte >= 0 ? lastByte + 1 : null;
+}
 
 let gisLoadPromise = null;
 
@@ -383,47 +397,133 @@ export class GoogleDriveProvider {
     return res.data;
   }
 
-  async _resumableUpload(filename, parentId, blob, mimeType, onProgress) {
-    const token = await this._ensureToken();
-    const initRes = await fetch(`${UPLOAD_API}/files?uploadType=resumable&fields=id,name,size`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
-        'X-Upload-Content-Type': mimeType,
-        'X-Upload-Content-Length': String(blob.size)
-      },
-      body: JSON.stringify({ name: filename, parents: [parentId] })
-    });
-    if (!initRes.ok) {
-      throw new Error(`初始化 Google Drive 断点续传失败 (${initRes.status})`);
-    }
-    const sessionUrl = initRes.headers.get('Location');
-    if (!sessionUrl) throw new Error('未获取到上传会话地址');
-
-    let offset = 0;
-    while (offset < blob.size) {
-      const end = Math.min(offset + CHUNK_SIZE, blob.size);
-      const chunk = blob.slice(offset, end);
-      const putRes = await fetch(sessionUrl, {
+  async _queryResumableOffset(sessionUrl, totalSize) {
+    try {
+      const res = await xhrUpload({
         method: 'PUT',
-        headers: {
-          'Content-Type': mimeType,
-          'Content-Range': `bytes ${offset}-${end - 1}/${blob.size}`
-        },
-        body: chunk
+        url: sessionUrl,
+        headers: { 'Content-Range': `bytes */${totalSize}` },
+        body: new Blob([]),
+        acceptStatuses: [200, 201, 308],
+        inactivityTimeoutMs: 30000
       });
-      if (putRes.status === 200 || putRes.status === 201) {
-        if (onProgress) onProgress(100);
-        return putRes.json();
+      if (res.status === 200 || res.status === 201) {
+        return { completed: true, data: res.data };
       }
-      if (putRes.status !== 308) {
-        throw new Error(`分片上传失败 (${putRes.status})`);
-      }
-      offset = end;
-      if (onProgress) onProgress(Math.round((offset / blob.size) * 100));
+      const next = parseGoogleRangeNextOffset(res.getHeader?.('Range'));
+      return { completed: false, nextOffset: next ?? 0 };
+    } catch (err) {
+      if (err?.status === 404 || err?.status === 410) return { expired: true };
+      return null;
     }
-    throw new Error('分片上传未返回文件 ID');
+  }
+
+  async _resumableUpload(filename, parentId, blob, mimeType, onProgress) {
+    for (let sessionAttempt = 0; sessionAttempt < 2; sessionAttempt++) {
+      const token = await this._ensureToken();
+      const initRes = await fetch(`${UPLOAD_API}/files?uploadType=resumable&fields=id,name,size`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json; charset=UTF-8',
+          'X-Upload-Content-Type': mimeType,
+          'X-Upload-Content-Length': String(blob.size)
+        },
+        body: JSON.stringify({ name: filename, parents: [parentId] })
+      });
+      if (!initRes.ok) {
+        throw new Error(`初始化 Google Drive 断点续传失败 (${initRes.status})`);
+      }
+      const sessionUrl = initRes.headers.get('Location');
+      if (!sessionUrl) throw new Error('未获取到上传会话地址');
+
+      appLog.info('GoogleDrive', `创建大文件分片上传会话: ${filename} (${formatBytes(blob.size)})`);
+
+      let offset = 0;
+      let sessionExpired = false;
+      let realignCount = 0;
+
+      while (offset < blob.size) {
+        const end = Math.min(offset + CHUNK_SIZE, blob.size);
+        const chunk = blob.slice(offset, end);
+        let chunkRestart = false;
+
+        for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
+          try {
+            const putRes = await xhrUpload({
+              method: 'PUT',
+              url: sessionUrl,
+              headers: {
+                'Content-Type': mimeType,
+                'Content-Range': `bytes ${offset}-${end - 1}/${blob.size}`
+              },
+              body: chunk,
+              acceptStatuses: [200, 201, 308],
+              inactivityTimeoutMs: 120000,
+              onProgress: (_, loaded) => {
+                const pct = Math.min(99, Math.max(1, Math.round(((offset + loaded) / blob.size) * 100)));
+                onProgress?.(pct, '');
+              }
+            });
+
+            if (putRes.status === 200 || putRes.status === 201) {
+              onProgress?.(100, '');
+              return putRes.data;
+            }
+            const nextFromRange = parseGoogleRangeNextOffset(putRes.getHeader?.('Range'));
+            offset = nextFromRange !== null && nextFromRange >= end ? nextFromRange : end;
+            onProgress?.(Math.min(99, Math.round((offset / blob.size) * 100)), '');
+            break;
+          } catch (err) {
+            if (err?.status === 404 || err?.status === 410) {
+              sessionExpired = true;
+              break;
+            }
+            const retryable =
+              err?.isNetworkError ||
+              err?.isTimeout ||
+              err?.status === 408 ||
+              err?.status === 429 ||
+              (err?.status >= 500 && err?.status < 600);
+
+            if (retryable && attempt < MAX_CHUNK_RETRIES) {
+              const probe = await this._queryResumableOffset(sessionUrl, blob.size);
+              if (probe?.completed && probe.data) {
+                onProgress?.(100, '');
+                return probe.data;
+              }
+              if (probe?.expired) {
+                sessionExpired = true;
+                break;
+              }
+              if (probe && Number.isFinite(probe.nextOffset) && probe.nextOffset !== offset && realignCount < 10) {
+                realignCount++;
+                offset = probe.nextOffset;
+                onProgress?.(Math.min(99, Math.round((offset / blob.size) * 100)), '');
+                chunkRestart = true;
+                break;
+              }
+              const waitMs = Math.min(12000, 1500 * attempt);
+              onProgress?.(Math.min(99, Math.round((offset / blob.size) * 100)), `重试 ${attempt}/${MAX_CHUNK_RETRIES - 1}`);
+              appLog.warn('GoogleDrive', `分片上传受阻 (${err?.status || err?.message})，${Math.round(waitMs / 1000)}s 后重试`);
+              await sleep(waitMs);
+              continue;
+            }
+            throw new Error(`Google Drive 分片上传失败 (${err?.status ? `HTTP ${err.status}` : err?.message || '网络异常'})`);
+          }
+        }
+
+        if (sessionExpired) break;
+        if (chunkRestart) continue;
+      }
+
+      if (sessionExpired && sessionAttempt === 0) {
+        appLog.warn('GoogleDrive', '上传会话已失效，正在重建会话重试');
+        continue;
+      }
+      throw new Error('分片上传未返回文件 ID');
+    }
+    throw new Error('Google Drive 上传会话多次失效');
   }
 
   async downloadFileBlob(remoteId, onProgress) {
@@ -431,7 +531,8 @@ export class GoogleDriveProvider {
     return xhrDownloadBlob({
       url: `${DRIVE_API}/files/${encodeURIComponent(remoteId)}?alt=media`,
       headers: { Authorization: `Bearer ${token}` },
-      onProgress
+      onProgress,
+      inactivityTimeoutMs: 120000
     });
   }
 

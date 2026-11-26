@@ -137,8 +137,96 @@ def test_onedrive_proxy_strict_host_allowlist(server):
         q = urllib.parse.quote(bad_url, safe="")
         status, _, _ = req(f"{base}/api/onedrive-proxy?url={q}")
         assert status == 403
+        status_put, _, _ = req(f"{base}/api/onedrive-upload-proxy?url={q}", method="PUT", data=b"abc")
+        assert status_put == 403
     assert clouddrop.is_allowed_onedrive_url("https://my.microsoftpersonalcontent.com/personal/abc/item") is True
     assert clouddrop.is_allowed_onedrive_url("https://public.dm.files.1drv.com/y4mTest") is True
+    assert clouddrop.is_allowed_onedrive_url("https://bn02pap001files.storage.live.com/upload/session") is True
+    assert clouddrop.is_allowed_onedrive_url("https://api.onedrive.live.com/v1.0/upload") is True
+
+
+def test_onedrive_proxy_streaming_and_retry_after(server, monkeypatch):
+    import io
+
+    base, _ = server
+    sample_payload = b"V" * (600 * 1024)  # > 256 KB to exercise multi-chunk streaming
+    captured_reqs: list[urllib.request.Request] = []
+
+    class FakeResp:
+        def __init__(self, status: int, body: bytes, headers: dict[str, str]):
+            self.status = status
+            self._buf = io.BytesIO(body)
+            self.headers = headers
+
+        def read(self, n: int = -1) -> bytes:
+            return self._buf.read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    real_urlopen = urllib.request.urlopen
+
+    def fake_urlopen(request_obj, timeout=None):
+        url = request_obj.full_url if isinstance(request_obj, urllib.request.Request) else str(request_obj)
+        if url.startswith("http://127.0.0.1:"):
+            return real_urlopen(request_obj, timeout=timeout)
+        captured_reqs.append(request_obj)
+        assert timeout == 120
+        if request_obj.get_method() == "GET":
+            return FakeResp(
+                200,
+                sample_payload,
+                {"Content-Type": "video/mp4", "Content-Length": str(len(sample_payload))},
+            )
+        if "retry-429" in url:
+            raise urllib.error.HTTPError(
+                url,
+                429,
+                "Too Many Requests",
+                {"Retry-After": "7", "Content-Type": "application/json"},
+                io.BytesIO(b'{"error":"throttled"}'),
+            )
+        return FakeResp(
+            202,
+            b'{"nextExpectedRanges":["6553600-"]}',
+            {"Content-Type": "application/json"},
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    # 1. Streaming GET preserves Content-Length & exact bytes
+    dl_q = urllib.parse.quote("https://my.microsoftpersonalcontent.com/personal/big.mp4", safe="")
+    status, headers, body = req(f"{base}/api/onedrive-proxy?url={dl_q}")
+    assert status == 200
+    assert headers.get("Content-Length") == str(len(sample_payload))
+    assert body == sample_payload
+
+    # 2. Chunked PUT forwards Content-Range + Content-Length and returns 202 JSON
+    up_q = urllib.parse.quote("https://my.microsoftpersonalcontent.com/upload/session1", safe="")
+    status, _, body = req(
+        f"{base}/api/onedrive-upload-proxy?url={up_q}",
+        method="PUT",
+        data=b"chunk-data-1234",
+        headers={"Content-Range": "bytes 0-14/100"},
+    )
+    assert status == 202
+    assert json.loads(body)["nextExpectedRanges"] == ["6553600-"]
+    put_req = captured_reqs[-1]
+    assert put_req.get_header("Content-range") == "bytes 0-14/100"
+    assert put_req.get_header("Content-length") == "15"
+
+    # 3. 429 forwards Retry-After header cleanly
+    up_429 = urllib.parse.quote("https://my.microsoftpersonalcontent.com/upload/retry-429", safe="")
+    status, headers, _ = req(
+        f"{base}/api/onedrive-upload-proxy?url={up_429}",
+        method="PUT",
+        data=b"chunk",
+    )
+    assert status == 429
+    assert headers.get("Retry-After") == "7"
 
 
 def test_logs_api_read_and_clear(tmp_path: Path):

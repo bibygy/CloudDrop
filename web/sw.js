@@ -2,7 +2,7 @@
 // 1. Offline-first app shell caching
 // 2. Android / PWA Web Share Target POST receiver
 
-const CACHE_NAME = 'clouddrop-shell-v1';
+const CACHE_NAME = 'clouddrop-shell-v2';
 const SHARE_CACHE = 'clouddrop-share-inbox';
 const SHELL_ASSETS = [
   './',

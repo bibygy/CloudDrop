@@ -14,12 +14,16 @@ import {
   generateSaltBase64,
   verifyCanary
 } from '../crypto/e2ee.js';
-import { sanitizeFileName } from '../providers/base.js';
+import { formatBytes, sanitizeFileName } from '../providers/base.js';
 import { LocalProvider } from '../providers/local.js';
 import { GoogleDriveProvider } from '../providers/gdrive.js';
 import { OneDriveProvider } from '../providers/onedrive.js';
 import { extractTags } from '../ui/markdown.js';
 import { appLog } from '../ui/logger.js';
+
+// Only consider a sync lock stale after 3 full minutes of ZERO upload/download/sync activity.
+// Active large-file uploads continuously refresh lastSyncActivityAt via progress heartbeats.
+const STALE_SYNC_IDLE_MS = 180000;
 
 export class SyncEngine {
   constructor() {
@@ -32,10 +36,20 @@ export class SyncEngine {
     this.e2eeSalt = null;
     this.syncing = false;
     this.syncStartedAt = 0;
+    this.lastSyncActivityAt = 0;
+    this._syncRunSeq = 0;
+    this._activeSyncRunId = 0;
     this.pollTimer = null;
     this.seenRemoteNames = new Set();
     this.blobUrlCache = new Map(); // fileId -> objectURL
     this.inflightBlobs = new Map(); // fileId -> Promise<Blob>
+    this.transientBlobs = new Map(); // fileId -> File/Blob fallback when IndexedDB quota is full
+  }
+
+  _touchSyncActivity(runId) {
+    if (runId && runId === this._activeSyncRunId) {
+      this.lastSyncActivityAt = Date.now();
+    }
   }
 
   getActiveProvider() {
@@ -104,6 +118,9 @@ export class SyncEngine {
     if (sec >= 5) {
       this.pollTimer = setInterval(() => {
         if (!document.hidden && navigator.onLine && this.getActiveProvider().isConnected()) {
+          if (this.syncing && Date.now() - this.lastSyncActivityAt < STALE_SYNC_IDLE_MS) {
+            return;
+          }
           this.syncNow({ silent: true });
         }
       }, sec * 1000);
@@ -245,7 +262,12 @@ export class SyncEngine {
       const safeName = sanitizeFileName(file.name || `paste_${now}.bin`);
       const mimeType = file.type || 'application/octet-stream';
       const remoteName = `${fileId}_${safeName}`;
-      await db.putBlob(fileId, file, { mimeType });
+      try {
+        await db.putBlob(fileId, file, { mimeType });
+      } catch (err) {
+        appLog.warn('Storage', `本地缓存空间不足，大文件 ${safeName} (${formatBytes(file.size || 0)}) 将直接从内存上传: ${err?.message || err}`);
+        this.transientBlobs.set(fileId, file);
+      }
       attachments.push({
         fileId,
         name: file.name || safeName,
@@ -353,6 +375,7 @@ export class SyncEngine {
     const provider = this.getActiveProvider();
     for (const att of item.attachments || []) {
       await db.deleteBlob(att.fileId);
+      this.transientBlobs.delete(att.fileId);
       const cachedUrl = this.blobUrlCache.get(att.fileId);
       if (cachedUrl) {
         URL.revokeObjectURL(cachedUrl);
@@ -378,32 +401,41 @@ export class SyncEngine {
       return { ok: false, reason: 'not_connected' };
     }
     if (this.syncing) {
-      // Recover automatically if a previous sync somehow wedged >45s
-      if (Date.now() - this.syncStartedAt < 45000) {
+      // Only break lock after STALE_SYNC_IDLE_MS (3 min) of ZERO progress/activity,
+      // never during an active multi-minute large-file upload!
+      const idleMs = Date.now() - this.lastSyncActivityAt;
+      if (idleMs < STALE_SYNC_IDLE_MS) {
         return { ok: true, skipped: true };
       }
-      appLog.warn('Sync', '检测到上一次同步任务超时未释放，已强制重置同步锁');
+      appLog.warn('Sync', `检测到同步任务已连续 ${Math.round(idleMs / 1000)} 秒无进度响应，已重置同步锁`);
     }
 
+    const runId = ++this._syncRunSeq;
+    this._activeSyncRunId = runId;
+    const isActiveRun = () => this._activeSyncRunId === runId;
+    const nowTs = Date.now();
     this.syncing = true;
-    this.syncStartedAt = Date.now();
+    this.syncStartedAt = nowTs;
+    this.lastSyncActivityAt = nowTs;
     this._refreshSyncBanner({ errorMessage: '' });
     const t0 = performance.now();
     appLog.info('Sync', `开始同步 (${provider.name})`);
 
     try {
       await provider.ensureWorkspace();
+      this._touchSyncActivity(runId);
 
       // Helper: push a single event (and its un-uploaded local blobs) to the active provider
-      const pushEventToRemote = async (rawEvent, fileName) => {
+      const pushEventToRemote = async (rawEvent, fileName, outboxEntry = null) => {
         const ev = structuredClone(rawEvent);
         ev.remoteFileName = fileName;
         const atts = ev.payload?.attachments || [];
 
         for (const att of atts) {
+          this._touchSyncActivity(runId);
           // If switching providers (e.g. local -> onedrive), local remoteId is not valid on cloud drive
           if (att.remoteId && att.remoteProvider === provider.id) continue;
-          const localBlob = await db.getBlob(att.fileId);
+          const localBlob = (await db.getBlob(att.fileId)) || this.transientBlobs.get(att.fileId);
           if (!localBlob) continue;
 
           const shouldEncrypt = Boolean(store.settings.e2eeEnabled && this.e2eeKey);
@@ -411,18 +443,43 @@ export class SyncEngine {
           const uploadName = shouldEncrypt ? `${att.remoteName}.enc` : att.remoteName;
           att.encrypted = shouldEncrypt;
 
-          store.setTransferProgress(att.fileId, { pct: 2, phase: 'upload' });
+          if (uploadBlob.size >= 1024 * 1024) {
+            appLog.info('Upload', `开始上传附件 ${att.name} (${formatBytes(uploadBlob.size)}) -> ${provider.name}`);
+          }
+          if (isActiveRun()) {
+            store.setTransferProgress(att.fileId, { pct: 1, phase: 'upload', note: '' });
+          }
           try {
             const uploaded = await provider.uploadFileBlob(
               uploadName,
               uploadBlob,
               shouldEncrypt ? 'application/octet-stream' : att.mimeType,
-              (pct) => store.setTransferProgress(att.fileId, { pct, phase: 'upload' })
+              (pct, note = '') => {
+                this._touchSyncActivity(runId);
+                if (!isActiveRun()) return;
+                store.setTransferProgress(att.fileId, {
+                  pct: Math.max(1, Math.min(100, Math.round(pct))),
+                  phase: 'upload',
+                  note
+                });
+              }
             );
+            this._touchSyncActivity(runId);
             att.remoteId = uploaded.remoteId;
             att.remoteProvider = provider.id;
+            // Immediately persist remoteId so retries never re-upload already completed attachments
+            await db.putEvent(ev);
+            if (outboxEntry) {
+              await db.enqueueOutbox({ ...outboxEntry, event: ev });
+            }
+            this.transientBlobs.delete(att.fileId);
+            if (uploadBlob.size >= 1024 * 1024) {
+              appLog.info('Upload', `附件上传完成 ${att.name} (${formatBytes(uploadBlob.size)})`);
+            }
           } finally {
-            store.setTransferProgress(att.fileId, null);
+            if (isActiveRun()) {
+              store.setTransferProgress(att.fileId, null);
+            }
           }
         }
 
@@ -432,6 +489,7 @@ export class SyncEngine {
             ? await encryptJson(ev, this.e2eeKey)
             : ev;
         await provider.uploadEventJson(fileName, wireObj);
+        this._touchSyncActivity(runId);
         this.seenRemoteNames.add(fileName);
       };
 
@@ -440,7 +498,8 @@ export class SyncEngine {
       const justPushedNames = new Set();
       let pushedCount = 0;
       for (const entry of outbox) {
-        await pushEventToRemote(entry.event, entry.remoteFileName);
+        if (!isActiveRun()) return { ok: false, superseded: true };
+        await pushEventToRemote(entry.event, entry.remoteFileName, entry);
         justPushedNames.add(entry.remoteFileName);
         await db.removeOutbox(entry.id);
         pushedCount++;
@@ -448,6 +507,7 @@ export class SyncEngine {
 
       // 2. Pull remote events unseen locally & backfill any pre-cloud local events missing from this drive
       const { events: remoteFiles } = await provider.listEvents();
+      this._touchSyncActivity(runId);
       const remoteNameSet = new Set(remoteFiles.map((rf) => rf.name).filter(Boolean));
       const localEvents = await db.getAllEvents();
       const knownOpIds = new Set(localEvents.map((e) => e.opId));
@@ -455,6 +515,7 @@ export class SyncEngine {
 
       // Backfill: if user sent notes in Local mode before connecting OneDrive/Google Drive, push them now
       for (const ev of localEvents) {
+        if (!isActiveRun()) return { ok: false, superseded: true };
         if (!ev || !ev.opId || ev.__lockedEnvelope) continue;
         const fname = ev.remoteFileName || `${String(ev.createdAt || Date.now()).padStart(14, '0')}_${ev.opId}.json`;
         if (!remoteNameSet.has(fname) && !justPushedNames.has(fname)) {
@@ -478,6 +539,8 @@ export class SyncEngine {
       let firstErrMsg = '';
       const CONCURRENCY = 6;
       for (let i = 0; i < toDownload.length; i += CONCURRENCY) {
+        if (!isActiveRun()) return { ok: false, superseded: true };
+        this._touchSyncActivity(runId);
         const batch = toDownload.slice(i, i + CONCURRENCY);
         const results = await Promise.all(
           batch.map(async (rf) => {
@@ -535,6 +598,7 @@ export class SyncEngine {
       const quota = await provider.getQuota().catch(() => null);
 
       await this.reloadFromDb();
+      if (!isActiveRun()) return { ok: false, superseded: true };
       this.syncing = false;
       const ms = Math.round(performance.now() - t0);
       if (failedDownloads > 0) {
@@ -551,8 +615,10 @@ export class SyncEngine {
     } catch (err) {
       appLog.error('Sync', `同步异常中断: ${err?.message || err}`);
       console.error('[SyncEngine]', err);
-      this.syncing = false;
-      this._refreshSyncBanner({ errorMessage: err.message || '同步失败' });
+      if (isActiveRun()) {
+        this.syncing = false;
+        this._refreshSyncBanner({ errorMessage: err.message || '同步失败' });
+      }
       if (!silent) throw err;
       return { ok: false, error: err.message };
     }
@@ -561,7 +627,7 @@ export class SyncEngine {
   // ---- On-Demand Blob Retrieval & Caching ----
 
   async getBlobForAttachment(att, { autoDownload = true } = {}) {
-    const cached = await db.getBlob(att.fileId);
+    const cached = (await db.getBlob(att.fileId)) || this.transientBlobs.get(att.fileId);
     if (cached) return cached;
 
     if (!autoDownload || !att.remoteId) return null;
@@ -573,10 +639,10 @@ export class SyncEngine {
     }
 
     const promise = (async () => {
-      store.setTransferProgress(att.fileId, { pct: 5, phase: 'download' });
+      store.setTransferProgress(att.fileId, { pct: 2, phase: 'download', note: '' });
       try {
-        let blob = await provider.downloadFileBlob(att.remoteId, (pct) => {
-          store.setTransferProgress(att.fileId, { pct, phase: 'download' });
+        let blob = await provider.downloadFileBlob(att.remoteId, (pct, note = '') => {
+          store.setTransferProgress(att.fileId, { pct, phase: 'download', note });
         });
         if (att.encrypted) {
           if (!this.e2eeKey) {
@@ -586,7 +652,11 @@ export class SyncEngine {
         } else if (att.mimeType && blob.type !== att.mimeType) {
           blob = new Blob([blob], { type: att.mimeType });
         }
-        await db.putBlob(att.fileId, blob, { mimeType: att.mimeType });
+        try {
+          await db.putBlob(att.fileId, blob, { mimeType: att.mimeType });
+        } catch (err) {
+          appLog.warn('Storage', `下载的大文件跳过本地 IndexedDB 缓存: ${err?.message || err}`);
+        }
         return blob;
       } finally {
         store.setTransferProgress(att.fileId, null);
@@ -621,11 +691,11 @@ export class SyncEngine {
       }
       const token = start.token;
       try {
-        const bytes = new Uint8Array(await blob.arrayBuffer());
+        // Slice Blob incrementally in 512 KB chunks so 120 MB+ videos never allocate a full ArrayBuffer in WebView RAM
         const CHUNK = 512 * 1024;
-        for (let offset = 0; offset < bytes.length; offset += CHUNK) {
-          const slice = bytes.subarray(offset, Math.min(offset + CHUNK, bytes.length));
-          const ok = bridge.appendSaveChunk(token, bytesToBase64(slice));
+        for (let offset = 0; offset < blob.size; offset += CHUNK) {
+          const buf = await blob.slice(offset, Math.min(offset + CHUNK, blob.size)).arrayBuffer();
+          const ok = bridge.appendSaveChunk(token, bytesToBase64(new Uint8Array(buf)));
           if (!ok) throw new Error('写入文件分片失败');
         }
         const done = JSON.parse(bridge.finishSaveFile(token));
@@ -714,6 +784,7 @@ export class SyncEngine {
   async clearLocalCache() {
     for (const u of this.blobUrlCache.values()) URL.revokeObjectURL(u);
     this.blobUrlCache.clear();
+    this.transientBlobs.clear();
     this.seenRemoteNames.clear();
     await Promise.all([db.clearEvents(), db.clearBlobs(), db.clearOutbox()]);
     await this.reloadFromDb();
